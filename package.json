@@ -1,0 +1,24 @@
+{
+  "name": "io-calculator",
+  "version": "1.0.0",
+  "description": "投入产出分析网页应用 - 浏览器端计算工具",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.1",
+    "handsontable": "^14.1.0",
+    "mathjs": "^12.2.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.6",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.10",
+    "vitest": "^1.1.3"
+  }
+}
