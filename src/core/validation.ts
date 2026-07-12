@@ -4,7 +4,7 @@
  */
 
 import type { IOData, ValidationResult, ValidationError } from '../types/io';
-import { getMatrixSize, isSquare, rowSum, colSum, vectorSubtract } from './matrix';
+import { MAX_BROWSER_SECTORS } from './limits';
 
 /**
  * 执行完整的数据校验
@@ -18,6 +18,20 @@ export function validateIOData(data: IOData, tolerance: number = 1e-6): Validati
     // 1. 维度校验
     validateDimensions(data, n, errors);
 
+    if (!Number.isFinite(tolerance) || tolerance <= 0) {
+        errors.push({
+            code: 'INVALID_TOLERANCE',
+            severity: 'error',
+            message: '容差必须是大于 0 的有限数值'
+        });
+    }
+
+    // 结构或非有限数值错误存在时，不再执行会计运算，避免错误数据
+    // 继续传播为看似正常的结果。
+    if (errors.some(error => error.severity === 'error')) {
+        return buildValidationResult(errors, stats);
+    }
+
     // 2. 零产出部门检测
     const zeroOutputSectors = detectZeroOutput(data.x);
     if (zeroOutputSectors.length > 0) {
@@ -27,9 +41,9 @@ export function validateIOData(data: IOData, tolerance: number = 1e-6): Validati
         ).join('、');
         errors.push({
             code: 'ZERO_OUTPUT',
-            severity: 'warning',
+            severity: 'error',
             message: `检测到 ${zeroOutputSectors.length} 个零产出部门`,
-            details: `部门：${sectorNames}。计算系数时这些部门的值将自动设为 0。`,
+            details: `部门：${sectorNames}。请删除、合并或修正这些部门后再计算。`,
             affectedSectors: zeroOutputSectors
         });
     }
@@ -57,53 +71,99 @@ export function validateIOData(data: IOData, tolerance: number = 1e-6): Validati
         }
     }
 
-    // 判断最终状态
-    const hasErrors = errors.some(e => e.severity === 'error');
-    const hasWarnings = errors.some(e => e.severity === 'warning');
+    return buildValidationResult(errors, stats);
+}
 
-    let status: 'pass' | 'warning' | 'fail';
-    let summary: string;
+function buildValidationResult(
+    errors: ValidationError[],
+    stats: ValidationResult['stats']
+): ValidationResult {
+    const errorCount = errors.filter(error => error.severity === 'error').length;
+    const warningCount = errors.filter(error => error.severity === 'warning').length;
 
-    if (hasErrors) {
-        status = 'fail';
-        summary = `校验失败：发现 ${errors.filter(e => e.severity === 'error').length} 个错误`;
-    } else if (hasWarnings) {
-        status = 'warning';
-        summary = `校验通过（有警告）：发现 ${errors.filter(e => e.severity === 'warning').length} 个警告`;
-    } else {
-        status = 'pass';
-        summary = '校验通过：所有检查项均正常';
+    if (errorCount > 0) {
+        return {
+            status: 'fail',
+            errors,
+            summary: `校验失败：发现 ${errorCount} 个错误`,
+            stats
+        };
     }
-
-    return { status, errors, summary, stats };
+    if (warningCount > 0) {
+        return {
+            status: 'warning',
+            errors,
+            summary: `校验通过（有警告）：发现 ${warningCount} 个警告`,
+            stats
+        };
+    }
+    return {
+        status: 'pass',
+        errors,
+        summary: '校验通过：所有检查项均正常',
+        stats
+    };
 }
 
 /**
  * 维度校验
  */
 function validateDimensions(data: IOData, n: number, errors: ValidationError[]): void {
-    // Z 矩阵必须是 n×n
-    if (!isSquare(data.Z)) {
-        const size = getMatrixSize(data.Z);
+    if (n === 0) {
         errors.push({
-            code: 'Z_NOT_SQUARE',
+            code: 'X_REQUIRED',
             severity: 'error',
-            message: `Z 矩阵不是方阵`,
-            details: `Z 维度为 ${size.rows}×${size.cols}，但应为 ${n}×${n}`
+            message: '必须提供总产出向量 x'
         });
-    } else if (data.Z.length !== n) {
+    } else {
+        validateFiniteVector(data.x, 'x', errors);
+        if (n > MAX_BROWSER_SECTORS) {
+            errors.push({
+                code: 'BROWSER_SIZE_LIMIT',
+                severity: 'error',
+                message: `浏览器版本最多支持 ${MAX_BROWSER_SECTORS} 个部门`,
+                details: `当前数据包含 ${n} 个部门。大型 MRIO 请使用后端或稀疏计算流程。`
+            });
+        }
+    }
+
+    if (data.Z.length === 0) {
         errors.push({
-            code: 'Z_X_MISMATCH',
+            code: 'Z_REQUIRED',
             severity: 'error',
-            message: `Z 矩阵与 x 向量维度不匹配`,
-            details: `Z 维度为 ${data.Z.length}×${data.Z.length}，x 长度为 ${n}`
+            message: '必须提供中间投入矩阵 Z'
         });
+    } else {
+        validateRectangularFiniteMatrix(data.Z, 'Z', errors);
+        if (!isSquare(data.Z)) {
+            const size = getMatrixSize(data.Z);
+            errors.push({
+                code: 'Z_NOT_SQUARE',
+                severity: 'error',
+                message: 'Z 矩阵不是方阵',
+                details: `Z 维度为 ${size.rows}×${size.cols}`
+            });
+        } else if (n > 0 && data.Z.length !== n) {
+            errors.push({
+                code: 'Z_X_MISMATCH',
+                severity: 'error',
+                message: 'Z 矩阵与 x 向量维度不匹配',
+                details: `Z 维度为 ${data.Z.length}×${data.Z.length}，x 长度为 ${n}`
+            });
+        }
     }
 
     // Y 矩阵（如提供）必须是 n×k
     if (data.Y) {
+        validateRectangularFiniteMatrix(data.Y, 'Y', errors);
         const ySize = getMatrixSize(data.Y);
-        if (ySize.rows !== n) {
+        if (ySize.rows === 0 || ySize.cols === 0) {
+            errors.push({
+                code: 'Y_EMPTY',
+                severity: 'error',
+                message: 'Y 矩阵不能为空'
+            });
+        } else if (ySize.rows !== n) {
             errors.push({
                 code: 'Y_ROWS_MISMATCH',
                 severity: 'error',
@@ -115,8 +175,15 @@ function validateDimensions(data: IOData, n: number, errors: ValidationError[]):
 
     // VA 增加值（如提供）必须是 1×n 或 m×n
     if (data.VA) {
+        validateRectangularFiniteMatrix(data.VA, 'VA', errors);
         const vaSize = getMatrixSize(data.VA);
-        if (vaSize.cols !== n) {
+        if (vaSize.rows === 0 || vaSize.cols === 0) {
+            errors.push({
+                code: 'VA_EMPTY',
+                severity: 'error',
+                message: 'VA 矩阵不能为空'
+            });
+        } else if (vaSize.cols !== n) {
             errors.push({
                 code: 'VA_COLS_MISMATCH',
                 severity: 'error',
@@ -128,8 +195,15 @@ function validateDimensions(data: IOData, n: number, errors: ValidationError[]):
 
     // F 卫星账户（如提供）必须是 p×n
     if (data.F) {
+        validateRectangularFiniteMatrix(data.F, 'F', errors);
         const fSize = getMatrixSize(data.F);
-        if (fSize.cols !== n) {
+        if (fSize.rows === 0 || fSize.cols === 0) {
+            errors.push({
+                code: 'F_EMPTY',
+                severity: 'error',
+                message: 'F 矩阵不能为空'
+            });
+        } else if (fSize.cols !== n) {
             errors.push({
                 code: 'F_COLS_MISMATCH',
                 severity: 'error',
@@ -137,6 +211,88 @@ function validateDimensions(data: IOData, n: number, errors: ValidationError[]):
                 details: `F 有 ${fSize.cols} 列，但应有 ${n} 列（与 x 一致）`
             });
         }
+    }
+
+    if (data.isMRIO) {
+        const regionCount = data.regions?.length || 0;
+        const sectorsPerRegion = data.sectorsPerRegion || 0;
+        if (regionCount < 2) {
+            errors.push({
+                code: 'MRIO_REGIONS_REQUIRED',
+                severity: 'error',
+                message: 'MRIO 模式必须提供至少两个区域名称'
+            });
+        }
+        if (!Number.isInteger(sectorsPerRegion) || sectorsPerRegion <= 0) {
+            errors.push({
+                code: 'MRIO_SECTORS_PER_REGION_INVALID',
+                severity: 'error',
+                message: 'MRIO 每区域部门数必须是正整数'
+            });
+        } else if (regionCount * sectorsPerRegion !== n) {
+            errors.push({
+                code: 'MRIO_DIMENSION_MISMATCH',
+                severity: 'error',
+                message: 'MRIO 区域配置与部门总数不一致',
+                details: `${regionCount} 个区域 × ${sectorsPerRegion} 个部门 = ${regionCount * sectorsPerRegion}，但 x 长度为 ${n}`
+            });
+        }
+    }
+}
+
+function validateFiniteVector(
+    vector: number[],
+    name: string,
+    errors: ValidationError[]
+): void {
+    const invalid = vector
+        .map((value, index) => ({ value, index }))
+        .filter(item => !Number.isFinite(item.value));
+    if (invalid.length > 0) {
+        errors.push({
+            code: `${name.toUpperCase()}_NON_FINITE`,
+            severity: 'error',
+            message: `${name} 包含 NaN 或 Infinity`,
+            details: invalid.slice(0, 5).map(item => `位置 ${item.index + 1}`).join('、')
+        });
+    }
+}
+
+function validateRectangularFiniteMatrix(
+    matrix: number[][],
+    name: string,
+    errors: ValidationError[]
+): void {
+    if (matrix.length === 0) return;
+
+    const expectedCols = matrix[0].length;
+    const raggedRows = matrix
+        .map((row, index) => ({ length: row.length, index }))
+        .filter(item => item.length !== expectedCols);
+    if (raggedRows.length > 0) {
+        errors.push({
+            code: `${name}_RAGGED`,
+            severity: 'error',
+            message: `${name} 存在不等长行`,
+            details: `首行 ${expectedCols} 列；异常行：${raggedRows.slice(0, 5).map(item => `${item.index + 1}(${item.length}列)`).join('、')}`
+        });
+    }
+
+    const invalidCells: string[] = [];
+    for (let row = 0; row < matrix.length; row++) {
+        for (let col = 0; col < matrix[row].length; col++) {
+            if (!Number.isFinite(matrix[row][col]) && invalidCells.length < 5) {
+                invalidCells.push(`第 ${row + 1} 行第 ${col + 1} 列`);
+            }
+        }
+    }
+    if (invalidCells.length > 0) {
+        errors.push({
+            code: `${name}_NON_FINITE`,
+            severity: 'error',
+            message: `${name} 包含 NaN 或 Infinity`,
+            details: invalidCells.join('、')
+        });
     }
 }
 
@@ -153,9 +309,6 @@ function detectZeroOutput(x: number[]): number[] {
     return zeroSectors;
 }
 
-/**
- * 非负性检查
- */
 /**
  * 非负性检查
  */
@@ -326,4 +479,34 @@ function checkAccountingIdentity(
     }
 
     return { errors, maxError, meanError };
+}
+
+function getMatrixSize(matrix: number[][]): { rows: number; cols: number } {
+    return {
+        rows: matrix.length,
+        cols: matrix[0]?.length || 0
+    };
+}
+
+function isSquare(matrix: number[][]): boolean {
+    return matrix.length > 0 && matrix.every(row => row.length === matrix.length);
+}
+
+function rowSum(matrix: number[][]): number[] {
+    return matrix.map(row => row.reduce((sum, value) => sum + value, 0));
+}
+
+function colSum(matrix: number[][]): number[] {
+    const cols = matrix[0]?.length || 0;
+    const sums = Array(cols).fill(0) as number[];
+    for (const row of matrix) {
+        for (let col = 0; col < cols; col++) {
+            sums[col] += row[col];
+        }
+    }
+    return sums;
+}
+
+function vectorSubtract(left: number[], right: number[]): number[] {
+    return left.map((value, index) => value - right[index]);
 }

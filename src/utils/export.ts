@@ -3,18 +3,25 @@
  * 支持 Excel、CSV、JSON 导出
  */
 
-import * as XLSX from 'xlsx';
+import type { WorkBook } from 'xlsx';
 import type { IOData, CalculationResults, ValidationResult } from '../types/io';
+
+type SpreadsheetModule = typeof import('xlsx');
 
 /**
  * 导出计算结果为 Excel（多 sheet）
  */
-export function exportResultsToExcel(
+export async function exportResultsToExcel(
     data: IOData,
     results: CalculationResults,
     validation?: ValidationResult
-): void {
+): Promise<void> {
+    const XLSX = await import('xlsx');
     const workbook = XLSX.utils.book_new();
+    const addMatrixSheet = appendMatrixSheet.bind(null, XLSX);
+    const addVectorSheet = appendVectorSheet.bind(null, XLSX);
+    const addValidationSheet = appendValidationSheet.bind(null, XLSX);
+    const addLogSheet = appendLogSheet.bind(null, XLSX);
 
     const sectorNames = data.sectorNames ||
         Array.from({ length: data.x.length }, (_, i) => `部门${i + 1}`);
@@ -54,6 +61,10 @@ export function exportResultsToExcel(
         addMatrixSheet(workbook, 'L_Leontief逆', results.L, sectorNames, sectorNames);
     }
 
+    if (results.G) {
+        addMatrixSheet(workbook, 'G_Ghosh逆', results.G, sectorNames, sectorNames);
+    }
+
     if (results.va_coef) {
         addVectorSheet(workbook, 'VA_Coef_增加值系数', results.va_coef, sectorNames);
     }
@@ -91,12 +102,31 @@ export function exportResultsToExcel(
             Array.from({ length: results.footprint.length }, (_, i) => `卫星${i + 1}`);
         if (results.footprint[0].length === 1) {
             // 单列足迹
-            addVectorSheet(workbook, '部门足迹',
+            addVectorSheet(workbook, '最终需求足迹',
                 results.footprint.map(row => row[0]), satNames);
         } else {
-            addMatrixSheet(workbook, '部门足迹', results.footprint, satNames,
-                data.finalDemandNames || ['最终需求']);
+            const finalDemandNames = data.finalDemandNames ||
+                Array.from({ length: results.footprint[0].length }, (_, i) => `最终需求${i + 1}`);
+            addMatrixSheet(workbook, '最终需求足迹', results.footprint, satNames,
+                finalDemandNames);
         }
+    }
+
+    if (results.backwardLinkage && results.forwardLinkage) {
+        const linkageRows = sectorNames.map((_, index) => [
+            results.backwardLinkage?.[index] || 0,
+            results.forwardLinkage?.[index] || 0,
+            results.backwardLinkageNorm?.[index] || 0,
+            results.forwardLinkageNorm?.[index] || 0,
+            results.keyIndustries?.[index] || 0
+        ]);
+        addMatrixSheet(
+            workbook,
+            '产业关联',
+            linkageRows,
+            sectorNames,
+            ['后向关联', '前向关联', '标准化后向', '标准化前向', '关键产业指数']
+        );
     }
 
     // 3. 添加校验报告
@@ -115,8 +145,9 @@ export function exportResultsToExcel(
 /**
  * 添加矩阵 sheet
  */
-function addMatrixSheet(
-    workbook: XLSX.WorkBook,
+function appendMatrixSheet(
+    XLSX: SpreadsheetModule,
+    workbook: WorkBook,
     sheetName: string,
     matrix: number[][],
     rowNames: string[],
@@ -140,8 +171,9 @@ function addMatrixSheet(
 /**
  * 添加向量 sheet
  */
-function addVectorSheet(
-    workbook: XLSX.WorkBook,
+function appendVectorSheet(
+    XLSX: SpreadsheetModule,
+    workbook: WorkBook,
     sheetName: string,
     vector: number[],
     names: string[]
@@ -159,8 +191,9 @@ function addVectorSheet(
 /**
  * 添加校验报告 sheet
  */
-function addValidationSheet(
-    workbook: XLSX.WorkBook,
+function appendValidationSheet(
+    XLSX: SpreadsheetModule,
+    workbook: WorkBook,
     validation: ValidationResult
 ): void {
     const data: (string | number)[][] = [
@@ -203,8 +236,9 @@ function addValidationSheet(
 /**
  * 添加计算日志 sheet
  */
-function addLogSheet(
-    workbook: XLSX.WorkBook,
+function appendLogSheet(
+    XLSX: SpreadsheetModule,
+    workbook: WorkBook,
     data: IOData,
     results: CalculationResults
 ): void {
@@ -240,6 +274,27 @@ function addLogSheet(
         logData.push(['计算足迹乘数 M', results.config.computeM ? '是' : '否']);
     }
 
+    if (results.numericDiagnostics) {
+        logData.push(['']);
+        logData.push(['数值诊断']);
+        if (results.numericDiagnostics.leontief) {
+            const diagnostic = results.numericDiagnostics.leontief;
+            logData.push(['Leontief 计算方式', diagnostic.method === 'solve' ? '线性方程求解' : '显式逆矩阵']);
+            if (diagnostic.conditionEstimate !== undefined) {
+                logData.push(['Leontief 条件估计', diagnostic.conditionEstimate]);
+            }
+            logData.push(['Leontief 残差', diagnostic.residual]);
+        }
+        if (results.numericDiagnostics.ghosh) {
+            const diagnostic = results.numericDiagnostics.ghosh;
+            logData.push(['Ghosh 计算方式', diagnostic.method === 'solve' ? '线性方程求解' : '显式逆矩阵']);
+            if (diagnostic.conditionEstimate !== undefined) {
+                logData.push(['Ghosh 条件估计', diagnostic.conditionEstimate]);
+            }
+            logData.push(['Ghosh 残差', diagnostic.residual]);
+        }
+    }
+
     if (data.metadata) {
         logData.push(['']);
         logData.push(['元数据']);
@@ -267,17 +322,25 @@ export function exportMatrixToCSV(
 
     // 标题行
     if (colNames) {
-        lines.push(['', ...colNames].join(','));
+        lines.push(['', ...colNames].map(escapeCSVCell).join(','));
     }
 
     // 数据行
     for (let i = 0; i < matrix.length; i++) {
         const rowName = rowNames?.[i] || '';
         const values = matrix[i].map(v => v.toString()).join(',');
-        lines.push(`${rowName},${values}`);
+        lines.push(`${escapeCSVCell(rowName)},${values}`);
     }
 
     downloadText(lines.join('\n'), fileName, 'text/csv');
+}
+
+export function escapeCSVCell(value: string): string {
+    const neutralized = /^[=+\-@]/.test(value) ? `'${value}` : value;
+    if (/[",\r\n]/.test(neutralized)) {
+        return `"${neutralized.replace(/"/g, '""')}"`;
+    }
+    return neutralized;
 }
 
 /**
@@ -289,7 +352,7 @@ export function exportResultsToJSON(
     validation?: ValidationResult
 ): void {
     const exportData = {
-        version: '1.0',
+        version: '2.0-alpha.3',
         exportedAt: new Date().toISOString(),
         metadata: data.metadata,
         dimensions: {

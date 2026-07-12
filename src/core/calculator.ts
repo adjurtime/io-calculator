@@ -15,10 +15,12 @@ import {
     matrixMultiply,
     matrixSubtract,
     matrixInverse,
-    matrixVectorMultiply,
+    matrixSolve,
     rowSum,
     colSum
 } from './matrix';
+import { validateIOData } from './validation';
+import { CONDITION_WARNING_THRESHOLD } from './limits';
 
 /**
  * 执行 IO 指标计算
@@ -33,25 +35,53 @@ export function calculateIOIndicators(
     };
     const errors: CalculationError[] = [];
 
+    const validation = validateIOData(data, config.tolerance);
+    if (validation.status === 'fail') {
+        return {
+            results,
+            errors: validation.errors
+                .filter(error => error.severity === 'error')
+                .map(error => ({
+                    code: error.code,
+                    message: error.message,
+                    details: error.details,
+                    severity: 'error'
+                }))
+        };
+    }
+
+    if (config.computeFootprint && data.F && !data.Y) {
+        return {
+            results,
+            errors: [{
+                code: 'FOOTPRINT_REQUIRES_FINAL_DEMAND',
+                message: '计算最终需求足迹必须提供 Y 矩阵',
+                severity: 'error'
+            }]
+        };
+    }
+
     const n = data.x.length;
 
     // 计算 diag(x)^{-1}，处理零产出部门
     const { matrix: xInvDiag, zeroIndices } = diagInverse(data.x);
 
+    // 零产出已由 validateIOData 作为阻断错误处理。保留返回值只用于
+    // 防止未来调用者绕过校验时静默除零。
     if (zeroIndices.length > 0) {
-        const sectorNames = zeroIndices.map(i =>
-            data.sectorNames?.[i] || `部门${i + 1}`
-        ).join('、');
-        errors.push({
-            code: 'ZERO_OUTPUT_HANDLED',
-            message: `${zeroIndices.length} 个零产出部门的系数已设为 0`,
-            details: `部门：${sectorNames}`
-        });
+        return {
+            results,
+            errors: [{
+                code: 'ZERO_OUTPUT',
+                message: '总产出向量包含零值，计算已停止',
+                severity: 'error'
+            }]
+        };
     }
 
     // 1. 直接消耗系数 A = Z · diag(x)^{-1}
     let A: number[][] | undefined;
-    if (config.computeA || config.computeL || config.computeM) {
+    if (config.computeA || config.computeL || config.computeM || config.computeFootprint || config.computeLinkage) {
         A = matrixMultiply(data.Z, xInvDiag);
         if (config.computeA) {
             results.A = A;
@@ -64,39 +94,55 @@ export function calculateIOIndicators(
     }
 
     // 3. 最终需求向量 y（合并 Y 的各列）
-    if (data.Y) {
-        if (config.aggregateFinalDemand) {
-            results.y = data.Y.map(row => row.reduce((sum, val) => sum + val, 0));
-        } else {
-            // 保留完整的 Y 矩阵供后续使用
-            results.y = data.Y.map(row => row.reduce((sum, val) => sum + val, 0));
-        }
+    if (data.Y && config.aggregateFinalDemand) {
+        results.y = data.Y.map(row => row.reduce((sum, val) => sum + val, 0));
     }
 
-    // 4. Leontief 逆 L = (I - A)^{-1}
+    // 4. Leontief 系统：只有需要展示完整逆矩阵、乘数或产业关联时才显式求逆。
     let L: number[][] | undefined;
-    if (config.computeL || config.computeM || config.computeLinkage) {
+    let IminusA: number[][] | undefined;
+    const leontiefNeedsInverse = config.computeL || config.computeM || config.computeLinkage;
+    if (leontiefNeedsInverse || config.computeFootprint) {
         if (!A) {
             A = matrixMultiply(data.Z, xInvDiag);
         }
 
         const I = identity(n);
-        const IminusA = matrixSubtract(I, A);
+        IminusA = matrixSubtract(I, A);
 
-        const invResult = matrixInverse(IminusA);
-        if (invResult.error) {
-            errors.push({
-                code: 'LEONTIEF_INVERSE_FAILED',
-                message: 'Leontief 逆矩阵计算失败',
-                details: invResult.error
-            });
-        } else {
-            L = invResult.matrix!;
-            if (config.computeL) {
-                results.L = L;
+        if (leontiefNeedsInverse) {
+            const invResult = matrixInverse(IminusA);
+            if (invResult.error) {
+                errors.push({
+                    code: 'LEONTIEF_INVERSE_FAILED',
+                    message: 'Leontief 逆矩阵计算失败',
+                    details: invResult.error,
+                    severity: 'error'
+                });
+            } else {
+                L = invResult.matrix!;
+                results.numericDiagnostics = {
+                    ...results.numericDiagnostics,
+                    leontief: {
+                        method: 'inverse',
+                        residual: invResult.inverseResidual ?? 0,
+                        conditionEstimate: invResult.conditionEstimate
+                    }
+                };
+                if ((invResult.conditionEstimate ?? 0) > CONDITION_WARNING_THRESHOLD) {
+                    errors.push({
+                        code: 'LEONTIEF_ILL_CONDITIONED',
+                        message: 'Leontief 系统可能病态，结果对输入误差较敏感',
+                        details: `无穷范数条件估计约为 ${(invResult.conditionEstimate ?? 0).toExponential(4)}`,
+                        severity: 'warning'
+                    });
+                }
+                if (config.computeL) {
+                    results.L = L;
 
-                // 计算产出乘数（L 列和）
-                results.outputMultiplier = colSum(L);
+                    // 计算产出乘数（L 列和）
+                    results.outputMultiplier = colSum(L);
+                }
             }
         }
     }
@@ -122,6 +168,22 @@ export function calculateIOIndicators(
             });
         } else {
             G = ghoshResult.matrix!;
+            results.numericDiagnostics = {
+                ...results.numericDiagnostics,
+                ghosh: {
+                    method: 'inverse',
+                    residual: ghoshResult.inverseResidual ?? 0,
+                    conditionEstimate: ghoshResult.conditionEstimate
+                }
+            };
+            if ((ghoshResult.conditionEstimate ?? 0) > CONDITION_WARNING_THRESHOLD) {
+                errors.push({
+                    code: 'GHOSH_ILL_CONDITIONED',
+                    message: 'Ghosh 系统可能病态，结果对输入误差较敏感',
+                    details: `无穷范数条件估计约为 ${(ghoshResult.conditionEstimate ?? 0).toExponential(4)}`,
+                    severity: 'warning'
+                });
+            }
             if (config.computeG) {
                 results.G = G;
             }
@@ -186,15 +248,35 @@ export function calculateIOIndicators(
         }
     }
 
-    // 9. 部门足迹 footprint = M · y 或 M · Y
-    if (config.computeFootprint && M && data.Y) {
-        if (config.aggregateFinalDemand && results.y) {
-            // 使用合并后的最终需求
-            const footprintVector = matrixVectorMultiply(M, results.y);
-            results.footprint = [footprintVector];
-        } else {
-            // 按最终需求分项计算
-            results.footprint = matrixMultiply(M, data.Y);
+    // 9. 部门足迹：已有完整 L 时使用 M；否则直接求解 (I-A)X=Y。
+    if (config.computeFootprint && s && data.Y) {
+        if (M) {
+            const demand = config.aggregateFinalDemand && results.y
+                ? results.y.map(value => [value])
+                : data.Y;
+            results.footprint = matrixMultiply(M, demand);
+        } else if (!leontiefNeedsInverse && IminusA) {
+            const demand = config.aggregateFinalDemand && results.y
+                ? results.y.map(value => [value])
+                : data.Y;
+            const solveResult = matrixSolve(IminusA, demand);
+            if (solveResult.error) {
+                errors.push({
+                    code: 'LEONTIEF_SOLVE_FAILED',
+                    message: 'Leontief 线性方程求解失败',
+                    details: solveResult.error,
+                    severity: 'error'
+                });
+            } else {
+                results.numericDiagnostics = {
+                    ...results.numericDiagnostics,
+                    leontief: {
+                        method: 'solve',
+                        residual: solveResult.solveResidual ?? 0
+                    }
+                };
+                results.footprint = matrixMultiply(s, solveResult.matrix!);
+            }
         }
     }
 
