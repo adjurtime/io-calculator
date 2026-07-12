@@ -72,10 +72,20 @@ export function matrixMultiply(A: number[][], B: number[][]): number[][] {
  */
 export function matrixVectorMultiply(A: number[][], v: number[]): number[] {
     const result = math.multiply(A, v);
-    if (Array.isArray(result)) {
-        return result as number[];
+    const maybeMatrix = result as unknown as { toArray?: () => unknown };
+    const raw: unknown = typeof maybeMatrix.toArray === 'function'
+        ? maybeMatrix.toArray()
+        : result;
+
+    if (Array.isArray(raw) && raw.every(value => typeof value === 'number')) {
+        return raw;
     }
-    return [result as number];
+
+    if (typeof raw === 'number') {
+        return [raw];
+    }
+
+    throw new Error('矩阵与向量乘法返回了非一维结果');
 }
 
 /**
@@ -100,17 +110,50 @@ export function matrixAdd(A: number[][], B: number[][]): number[][] {
  */
 export function matrixInverse(A: number[][]): { matrix: number[][] | null; error: string | null } {
     try {
-        // 检查是否接近奇异
-        const det = math.det(A);
-        if (Math.abs(det) < 1e-12) {
+        const n = A.length;
+        if (n === 0 || A.some(row => row.length !== n)) {
             return {
                 matrix: null,
-                error: `矩阵接近奇异（行列式 = ${det.toExponential(4)}），无法求逆。可能原因：某行/列全为0，或存在线性相关行/列。`
+                error: '矩阵必须是非空方阵'
+            };
+        }
+        if (A.some(row => row.some(value => !Number.isFinite(value)))) {
+            return {
+                matrix: null,
+                error: '矩阵包含 NaN 或 Infinity'
             };
         }
 
         const inv = math.inv(A);
-        return { matrix: matrixToArray(inv), error: null };
+        const inverse = matrixToArray(inv);
+
+        if (inverse.some(row => row.some(value => !Number.isFinite(value)))) {
+            return {
+                matrix: null,
+                error: '矩阵求逆产生了非有限数值'
+            };
+        }
+
+        // 用 A·A⁻¹ 与单位矩阵的残差检查结果，避免以行列式绝对值误判
+        // 尺度较小但条件良好的矩阵。
+        const product = matrixMultiply(A, inverse);
+        let maxResidual = 0;
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < n; j++) {
+                const expected = i === j ? 1 : 0;
+                maxResidual = Math.max(maxResidual, Math.abs(product[i][j] - expected));
+            }
+        }
+
+        const residualTolerance = 1e-8 * Math.max(1, n);
+        if (!Number.isFinite(maxResidual) || maxResidual > residualTolerance) {
+            return {
+                matrix: null,
+                error: `矩阵求逆残差过大（${maxResidual.toExponential(4)}）`
+            };
+        }
+
+        return { matrix: inverse, error: null };
     } catch (e) {
         return {
             matrix: null,
@@ -180,7 +223,7 @@ export function vectorElementwiseMultiply(a: number[], b: number[]): number[] {
 /**
  * 将 mathjs Matrix 转换为二维数组
  */
-function matrixToArray(m: Matrix | number[][] | number): number[][] {
+function matrixToArray(m: Matrix | number[][] | number[] | number): number[][] {
     if (typeof m === 'number') {
         return [[m]];
     }

@@ -19,6 +19,7 @@ import {
     rowSum,
     colSum
 } from './matrix';
+import { validateIOData } from './validation';
 
 /**
  * 执行 IO 指标计算
@@ -33,25 +34,50 @@ export function calculateIOIndicators(
     };
     const errors: CalculationError[] = [];
 
+    const validation = validateIOData(data, config.tolerance);
+    if (validation.status === 'fail') {
+        return {
+            results,
+            errors: validation.errors
+                .filter(error => error.severity === 'error')
+                .map(error => ({
+                    code: error.code,
+                    message: error.message,
+                    details: error.details
+                }))
+        };
+    }
+
+    if (config.computeFootprint && data.F && !data.Y) {
+        return {
+            results,
+            errors: [{
+                code: 'FOOTPRINT_REQUIRES_FINAL_DEMAND',
+                message: '计算最终需求足迹必须提供 Y 矩阵'
+            }]
+        };
+    }
+
     const n = data.x.length;
 
     // 计算 diag(x)^{-1}，处理零产出部门
     const { matrix: xInvDiag, zeroIndices } = diagInverse(data.x);
 
+    // 零产出已由 validateIOData 作为阻断错误处理。保留返回值只用于
+    // 防止未来调用者绕过校验时静默除零。
     if (zeroIndices.length > 0) {
-        const sectorNames = zeroIndices.map(i =>
-            data.sectorNames?.[i] || `部门${i + 1}`
-        ).join('、');
-        errors.push({
-            code: 'ZERO_OUTPUT_HANDLED',
-            message: `${zeroIndices.length} 个零产出部门的系数已设为 0`,
-            details: `部门：${sectorNames}`
-        });
+        return {
+            results,
+            errors: [{
+                code: 'ZERO_OUTPUT',
+                message: '总产出向量包含零值，计算已停止'
+            }]
+        };
     }
 
     // 1. 直接消耗系数 A = Z · diag(x)^{-1}
     let A: number[][] | undefined;
-    if (config.computeA || config.computeL || config.computeM) {
+    if (config.computeA || config.computeL || config.computeM || config.computeFootprint || config.computeLinkage) {
         A = matrixMultiply(data.Z, xInvDiag);
         if (config.computeA) {
             results.A = A;
@@ -64,18 +90,13 @@ export function calculateIOIndicators(
     }
 
     // 3. 最终需求向量 y（合并 Y 的各列）
-    if (data.Y) {
-        if (config.aggregateFinalDemand) {
-            results.y = data.Y.map(row => row.reduce((sum, val) => sum + val, 0));
-        } else {
-            // 保留完整的 Y 矩阵供后续使用
-            results.y = data.Y.map(row => row.reduce((sum, val) => sum + val, 0));
-        }
+    if (data.Y && config.aggregateFinalDemand) {
+        results.y = data.Y.map(row => row.reduce((sum, val) => sum + val, 0));
     }
 
     // 4. Leontief 逆 L = (I - A)^{-1}
     let L: number[][] | undefined;
-    if (config.computeL || config.computeM || config.computeLinkage) {
+    if (config.computeL || config.computeM || config.computeFootprint || config.computeLinkage) {
         if (!A) {
             A = matrixMultiply(data.Z, xInvDiag);
         }
@@ -191,7 +212,7 @@ export function calculateIOIndicators(
         if (config.aggregateFinalDemand && results.y) {
             // 使用合并后的最终需求
             const footprintVector = matrixVectorMultiply(M, results.y);
-            results.footprint = [footprintVector];
+            results.footprint = footprintVector.map(value => [value]);
         } else {
             // 按最终需求分项计算
             results.footprint = matrixMultiply(M, data.Y);

@@ -57,6 +57,10 @@ export function aggregateSectors(data: IOData, config: AggregationConfig): IODat
         throw new Error(error);
     }
 
+    const mrioSectorsPerRegion = data.isMRIO
+        ? validateMrioAggregation(data, config)
+        : undefined;
+
     // 创建快速查找映射：原部门索引 -> 新部门索引
     const sectorMap = new Array<number>(n);
     for (let newIdx = 0; newIdx < config.groups.length; newIdx++) {
@@ -130,19 +134,55 @@ export function aggregateSectors(data: IOData, config: AggregationConfig): IODat
     };
 
     // 处理 MRIO 情况
-    if (data.isMRIO && data.regions && data.sectorsPerRegion) {
-        // 检查是否是按区域内合并
-        const oldSectorsPerRegion = data.sectorsPerRegion;
-        const newSectorsPerRegion = m / data.regions.length;
-
-        if (Number.isInteger(newSectorsPerRegion)) {
-            result.isMRIO = true;
-            result.regions = data.regions;
-            result.sectorsPerRegion = newSectorsPerRegion;
-        }
+    if (mrioSectorsPerRegion !== undefined && data.regions) {
+        result.isMRIO = true;
+        result.regions = data.regions;
+        result.sectorsPerRegion = mrioSectorsPerRegion;
     }
 
     return result;
+}
+
+function validateMrioAggregation(data: IOData, config: AggregationConfig): number {
+    const regionCount = data.regions?.length || 0;
+    const sectorsPerRegion = data.sectorsPerRegion || 0;
+    const n = data.x.length;
+
+    if (regionCount < 2 || sectorsPerRegion <= 0 || regionCount * sectorsPerRegion !== n) {
+        throw new Error('MRIO 区域配置无效，无法执行部门合并');
+    }
+
+    const groupsByRegion: number[][][] = Array.from({ length: regionCount }, () => []);
+    let previousRegion = -1;
+
+    for (const group of config.groups) {
+        const regions = new Set(group.map(index => Math.floor(index / sectorsPerRegion)));
+        if (regions.size !== 1) {
+            throw new Error('MRIO 合并组不能跨越区域边界');
+        }
+
+        const region = regions.values().next().value as number;
+        if (region < previousRegion) {
+            throw new Error('MRIO 合并组必须按区域连续排列');
+        }
+        previousRegion = region;
+        groupsByRegion[region].push(group.map(index => index % sectorsPerRegion));
+    }
+
+    const groupsPerRegion = groupsByRegion[0].length;
+    if (groupsPerRegion === 0 || groupsByRegion.some(groups => groups.length !== groupsPerRegion)) {
+        throw new Error('每个 MRIO 区域必须使用相同数量的合并组');
+    }
+
+    const reference = groupsByRegion[0].map(group => [...group].sort((a, b) => a - b).join(','));
+    for (let region = 1; region < regionCount; region++) {
+        const signatures = groupsByRegion[region].map(group => [...group].sort((a, b) => a - b).join(','));
+        if (signatures.some((signature, index) => signature !== reference[index])) {
+            throw new Error('所有 MRIO 区域必须使用相同的部门合并规则');
+        }
+    }
+
+    return groupsPerRegion;
 }
 
 /**
@@ -199,7 +239,6 @@ export function createMrioAggregation(
     mergeRules: MrioMergeRule[],
     sectorNames?: string[]
 ): AggregationConfig {
-    const n = sectorsPerRegion * regionCount;
     const groups: number[][] = [];
     const newSectorNames: string[] = [];
 
@@ -270,4 +309,3 @@ export function parseMergeRules(text: string): MrioMergeRule[] {
 
     return rules;
 }
-

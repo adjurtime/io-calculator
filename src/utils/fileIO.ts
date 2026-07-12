@@ -6,6 +6,24 @@
 import * as XLSX from 'xlsx';
 import type { IOData } from '../types/io';
 
+export interface MatrixParseError {
+    row: number;
+    column: number;
+    value: string;
+    message: string;
+}
+
+export interface ParsedNumericMatrix {
+    matrix: number[][];
+    rowNames?: string[];
+    colNames?: string[];
+    errors: MatrixParseError[];
+}
+
+export interface ParsedNumericVector extends ParsedNumericMatrix {
+    vector: number[];
+}
+
 /**
  * 读取 Excel 文件
  */
@@ -149,10 +167,11 @@ export async function readMATFile(file: File): Promise<{
                 // 全是数字，当作文本矩阵处理
                 const txtResult = await readTXTFile(file);
                 if (txtResult.data.length > 0) {
-                    const matrix = txtResult.data.map(row =>
-                        row.map(v => parseFloat(v) || 0)
-                    );
-                    return { variables: [{ name: 'matrix', data: matrix }] };
+                    const parsed = parseNumericMatrix(txtResult.data);
+                    if (parsed.errors.length > 0) {
+                        return { variables: [], error: formatMatrixParseErrors(parsed.errors) };
+                    }
+                    return { variables: [{ name: 'matrix', data: parsed.matrix }] };
                 }
             }
             return { variables: [], error: '不支持的 MAT 文件格式，请使用 MAT-file v5/v7 或导出为 TXT/CSV' };
@@ -343,13 +362,20 @@ export async function readMatrixFile(file: File): Promise<{
             const result = await readExcelFile(file);
             if (result.error) return { matrices: [], error: result.error };
 
-            const matrices = result.sheets.map(sheet => {
+            const matrices: { name: string; data: number[][] }[] = [];
+            for (const sheet of result.sheets) {
                 const parsed = parseNumericMatrix(sheet.data, true, true);
-                return {
+                if (parsed.errors.length > 0) {
+                    return {
+                        matrices: [],
+                        error: `Sheet "${sheet.name}" 解析失败：${formatMatrixParseErrors(parsed.errors)}`
+                    };
+                }
+                matrices.push({
                     name: sheet.name,
                     data: parsed.matrix
-                };
-            });
+                });
+            }
             return { matrices };
         }
 
@@ -358,6 +384,9 @@ export async function readMatrixFile(file: File): Promise<{
             if (result.error) return { matrices: [], error: result.error };
 
             const parsed = parseNumericMatrix(result.data, true, true);
+            if (parsed.errors.length > 0) {
+                return { matrices: [], error: formatMatrixParseErrors(parsed.errors) };
+            }
             return {
                 matrices: [{ name: file.name.replace('.csv', ''), data: parsed.matrix }],
                 sectorNames: parsed.rowNames
@@ -370,6 +399,9 @@ export async function readMatrixFile(file: File): Promise<{
             if (result.error) return { matrices: [], error: result.error };
 
             const parsed = parseNumericMatrix(result.data, false, false);
+            if (parsed.errors.length > 0) {
+                return { matrices: [], error: formatMatrixParseErrors(parsed.errors) };
+            }
             return {
                 matrices: [{ name: file.name.replace(/\.(txt|dat)$/, ''), data: parsed.matrix }]
             };
@@ -425,24 +457,39 @@ export function parseNumericMatrix(
     data: string[][],
     skipFirstRow: boolean = false,
     skipFirstCol: boolean = false
-): {
-    matrix: number[][];
-    rowNames?: string[];
-    colNames?: string[];
-} {
+): ParsedNumericMatrix {
+    const errors: MatrixParseError[] = [];
     if (data.length === 0) {
-        return { matrix: [] };
+        return {
+            matrix: [],
+            errors: [{ row: 1, column: 1, value: '', message: '数据为空' }]
+        };
     }
 
-    let startRow = skipFirstRow ? 1 : 0;
-    let startCol = skipFirstCol ? 1 : 0;
+    const startRow = skipFirstRow ? 1 : 0;
+    const startCol = skipFirstCol ? 1 : 0;
+
+    if (startRow >= data.length) {
+        return {
+            matrix: [],
+            errors: [{ row: data.length, column: 1, value: '', message: '标题行之后没有数值数据' }]
+        };
+    }
+
+    const expectedCols = Math.max(0, (data[startRow]?.length || 0) - startCol);
+    if (expectedCols === 0) {
+        return {
+            matrix: [],
+            errors: [{ row: startRow + 1, column: startCol + 1, value: '', message: '没有可解析的数值列' }]
+        };
+    }
 
     // 提取名称
     let colNames: string[] | undefined;
     let rowNames: string[] | undefined;
 
     if (skipFirstRow && data.length > 0) {
-        colNames = data[0].slice(startCol);
+        colNames = data[0].slice(startCol, startCol + expectedCols);
     }
 
     if (skipFirstCol) {
@@ -455,10 +502,31 @@ export function parseNumericMatrix(
     // 解析数值
     const matrix: number[][] = [];
     for (let i = startRow; i < data.length; i++) {
+        const actualCols = Math.max(0, data[i].length - startCol);
+        if (actualCols !== expectedCols) {
+            errors.push({
+                row: i + 1,
+                column: startCol + 1,
+                value: '',
+                message: `行宽不一致：应为 ${expectedCols} 列，实际为 ${actualCols} 列`
+            });
+        }
+
         const row: number[] = [];
-        for (let j = startCol; j < data[i].length; j++) {
-            const val = parseFloat(data[i][j]);
-            row.push(isNaN(val) ? 0 : val);
+        for (let offset = 0; offset < expectedCols; offset++) {
+            const j = startCol + offset;
+            const raw = data[i][j] ?? '';
+            const trimmed = raw.trim();
+            const value = trimmed === '' ? Number.NaN : Number(trimmed);
+            if (!Number.isFinite(value)) {
+                errors.push({
+                    row: i + 1,
+                    column: j + 1,
+                    value: raw,
+                    message: trimmed === '' ? '单元格为空' : '不是有限数值'
+                });
+            }
+            row.push(value);
         }
         matrix.push(row);
     }
@@ -472,7 +540,51 @@ export function parseNumericMatrix(
     // 
     // MRIO 区域配置现在由用户手动输入，不再自动解析
 
-    return { matrix, rowNames, colNames };
+    return { matrix, rowNames, colNames, errors };
+}
+
+/**
+ * 解析行向量或列向量。启用标题时，若数据区有多列，则自动把第一列
+ * 视为行标签，以兼容“部门名称 + x”工作表。
+ */
+export function parseNumericVector(
+    data: string[][],
+    skipFirstRow: boolean = false,
+    skipFirstCol: boolean | 'auto' = 'auto'
+): ParsedNumericVector {
+    const startRow = skipFirstRow ? 1 : 0;
+    const firstDataRow = data[startRow] || [];
+    const firstCell = firstDataRow[0]?.trim() || '';
+    const firstCellIsNumeric = firstCell !== '' && Number.isFinite(Number(firstCell));
+    const shouldSkipFirstCol = skipFirstCol === 'auto'
+        ? skipFirstRow && firstDataRow.length > 1 && !firstCellIsNumeric
+        : skipFirstCol;
+    const parsed = parseNumericMatrix(data, skipFirstRow, shouldSkipFirstCol);
+    const errors = [...parsed.errors];
+
+    let vector: number[] = [];
+    if (parsed.matrix.length === 1) {
+        vector = parsed.matrix[0];
+    } else if (parsed.matrix.length > 0 && parsed.matrix.every(row => row.length === 1)) {
+        vector = parsed.matrix.map(row => row[0]);
+    } else if (parsed.matrix.length > 0) {
+        errors.push({
+            row: startRow + 1,
+            column: shouldSkipFirstCol ? 2 : 1,
+            value: '',
+            message: '总产出 x 必须是一行或一列'
+        });
+    }
+
+    return { ...parsed, vector, errors };
+}
+
+export function formatMatrixParseErrors(errors: MatrixParseError[], limit: number = 5): string {
+    const visible = errors.slice(0, limit).map(error =>
+        `第 ${error.row} 行第 ${error.column} 列：${error.message}${error.value ? `（${error.value}）` : ''}`
+    );
+    const remaining = errors.length - visible.length;
+    return `${visible.join('；')}${remaining > 0 ? `；另有 ${remaining} 个问题` : ''}`;
 }
 
 
@@ -485,7 +597,9 @@ export function parseClipboardMatrix(text: string): {
     data: string[][];
     delimiter: 'tab' | 'comma' | 'space';
 } {
-    const lines = text.trim().split(/\r?\n/);
+    const lines = text.replace(/\r\n?/g, '\n').split('\n');
+    while (lines.length > 0 && lines[0].trim() === '') lines.shift();
+    while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
 
     // 检测分隔符
     const firstLine = lines[0] || '';
@@ -512,8 +626,8 @@ export function parseClipboardMatrix(text: string): {
                 values = line.trim().split(/\s+/);
                 break;
         }
-        // 过滤空值和空白字符串，避免误识别
-        return values.filter(v => v.trim().length > 0);
+        // Tab/CSV 中的空单元格必须保留原位置，随后由严格数值解析器报告。
+        return values.map(value => value.trim());
     });
 
     return { data, delimiter };
@@ -557,28 +671,23 @@ export function autoParseIOData(
 
         for (const [pattern, field] of Object.entries(sheetNamePatterns)) {
             if (nameLower.includes(pattern)) {
-                // 尝试解析
-                const parsed = parseNumericMatrix(sheet.data, true, field !== 'x');
-
                 if (field === 'x') {
-                    // x 向量处理逻辑...
-                    if (parsed.matrix.length > 0) {
-                        if (parsed.matrix[0].length === 1) {
-                            result.x = parsed.matrix.map(row => row[0]);
-                        } else if (parsed.matrix.length === 1) {
-                            result.x = parsed.matrix[0];
-                        } else {
-                            // 歧义处理...
-                            warnings.push(`'${sheet.name}' sheet 维度不明确，默认取第一列作为总产出向量`);
-                            result.x = parsed.matrix.map(row => row[0]);
-                        }
+                    const parsed = parseNumericVector(sheet.data, true);
+                    if (parsed.errors.length > 0) {
+                        warnings.push(`'${sheet.name}' 解析失败：${formatMatrixParseErrors(parsed.errors)}`);
+                    } else {
+                        result.x = parsed.vector;
                     }
                 } else {
-                    (result as Record<string, unknown>)[field] = parsed.matrix;
-                }
-
-                if (parsed.rowNames && field === 'Z') {
-                    result.sectorNames = parsed.rowNames;
+                    const parsed = parseNumericMatrix(sheet.data, true, true);
+                    if (parsed.errors.length > 0) {
+                        warnings.push(`'${sheet.name}' 解析失败：${formatMatrixParseErrors(parsed.errors)}`);
+                    } else {
+                        (result as Record<string, unknown>)[field] = parsed.matrix;
+                        if (parsed.rowNames && field === 'Z') {
+                            result.sectorNames = parsed.rowNames;
+                        }
+                    }
                 }
 
                 // MRIO 信息现在由用户手动配置，不再自动检测

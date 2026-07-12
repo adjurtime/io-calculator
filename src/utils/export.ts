@@ -54,6 +54,10 @@ export function exportResultsToExcel(
         addMatrixSheet(workbook, 'L_Leontief逆', results.L, sectorNames, sectorNames);
     }
 
+    if (results.G) {
+        addMatrixSheet(workbook, 'G_Ghosh逆', results.G, sectorNames, sectorNames);
+    }
+
     if (results.va_coef) {
         addVectorSheet(workbook, 'VA_Coef_增加值系数', results.va_coef, sectorNames);
     }
@@ -91,12 +95,31 @@ export function exportResultsToExcel(
             Array.from({ length: results.footprint.length }, (_, i) => `卫星${i + 1}`);
         if (results.footprint[0].length === 1) {
             // 单列足迹
-            addVectorSheet(workbook, '部门足迹',
+            addVectorSheet(workbook, '最终需求足迹',
                 results.footprint.map(row => row[0]), satNames);
         } else {
-            addMatrixSheet(workbook, '部门足迹', results.footprint, satNames,
-                data.finalDemandNames || ['最终需求']);
+            const finalDemandNames = data.finalDemandNames ||
+                Array.from({ length: results.footprint[0].length }, (_, i) => `最终需求${i + 1}`);
+            addMatrixSheet(workbook, '最终需求足迹', results.footprint, satNames,
+                finalDemandNames);
         }
+    }
+
+    if (results.backwardLinkage && results.forwardLinkage) {
+        const linkageRows = sectorNames.map((_, index) => [
+            results.backwardLinkage?.[index] || 0,
+            results.forwardLinkage?.[index] || 0,
+            results.backwardLinkageNorm?.[index] || 0,
+            results.forwardLinkageNorm?.[index] || 0,
+            results.keyIndustries?.[index] || 0
+        ]);
+        addMatrixSheet(
+            workbook,
+            '产业关联',
+            linkageRows,
+            sectorNames,
+            ['后向关联', '前向关联', '标准化后向', '标准化前向', '关键产业指数']
+        );
     }
 
     // 3. 添加校验报告
@@ -267,17 +290,25 @@ export function exportMatrixToCSV(
 
     // 标题行
     if (colNames) {
-        lines.push(['', ...colNames].join(','));
+        lines.push(['', ...colNames].map(escapeCSVCell).join(','));
     }
 
     // 数据行
     for (let i = 0; i < matrix.length; i++) {
         const rowName = rowNames?.[i] || '';
         const values = matrix[i].map(v => v.toString()).join(',');
-        lines.push(`${rowName},${values}`);
+        lines.push(`${escapeCSVCell(rowName)},${values}`);
     }
 
     downloadText(lines.join('\n'), fileName, 'text/csv');
+}
+
+export function escapeCSVCell(value: string): string {
+    const neutralized = /^[=+\-@]/.test(value) ? `'${value}` : value;
+    if (/[",\r\n]/.test(neutralized)) {
+        return `"${neutralized.replace(/"/g, '""')}"`;
+    }
+    return neutralized;
 }
 
 /**
@@ -289,7 +320,7 @@ export function exportResultsToJSON(
     validation?: ValidationResult
 ): void {
     const exportData = {
-        version: '1.0',
+        version: '2.0-alpha.1',
         exportedAt: new Date().toISOString(),
         metadata: data.metadata,
         dimensions: {

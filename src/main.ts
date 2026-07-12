@@ -3,11 +3,19 @@
  */
 
 import './index.css';
-import type { IOData, CalculationConfig, CalculationResults, ValidationResult } from './types/io';
+import type { IOData, CalculationConfig, CalculationError, CalculationResults, ValidationResult } from './types/io';
 import { DEFAULT_CONFIG } from './types/io';
 import { validateIOData } from './core/validation';
 import { calculateIOIndicators } from './core/calculator';
-import { createSampleIOData, parseClipboardMatrix, parseNumericMatrix } from './utils/fileIO';
+import {
+  createSampleIOData,
+  formatMatrixParseErrors,
+  parseClipboardMatrix,
+  parseNumericMatrix,
+  parseNumericVector,
+  readExcelFile,
+  readMatrixFile
+} from './utils/fileIO';
 import { exportResultsToExcel, exportResultsToJSON } from './utils/export';
 
 // ECharts type declaration
@@ -21,12 +29,18 @@ interface ExcelSheetInfo {
   cols: number;
 }
 
+interface ResultTab {
+  id: string;
+  label: string;
+}
+
 interface AppState {
   currentStep: number;
   data: IOData | null;
   validation: ValidationResult | null;
   config: CalculationConfig;
   results: CalculationResults | null;
+  calculationErrors: CalculationError[];
   // Excel Sheet 选择相关
   excelSheets: ExcelSheetInfo[];
   showSheetModal: boolean;
@@ -47,6 +61,7 @@ const state: AppState = {
   validation: null,
   config: { ...DEFAULT_CONFIG },
   results: null,
+  calculationErrors: [],
   excelSheets: [],
   showSheetModal: false,
   pendingFile: null,
@@ -137,6 +152,7 @@ function renderStepContent(): string {
 
 // 步骤1：数据输入
 function renderDataInput(): string {
+  const sectorCount = state.data ? getSectorCount(state.data) : 0;
   return `
     <div class="card">
       <div class="card-header">
@@ -185,16 +201,16 @@ function renderDataInput(): string {
                    value="${state.mrioConfig.regionCount}" min="1" step="1">
           </div>
           <div class="form-group" style="margin-bottom:0">
-            <label class="form-label">每区域部门数 ${state.data ? `<span class="text-muted">(默认=${Math.floor(state.data.x.length / state.mrioConfig.regionCount)})</span>` : ''}</label>
+            <label class="form-label">每区域部门数 ${state.data ? `<span class="text-muted">(默认=${Math.floor(sectorCount / state.mrioConfig.regionCount)})</span>` : ''}</label>
             <input type="number" class="form-input" id="mrio-sectors-per-region" 
                    value="${state.mrioConfig.sectorsPerRegion || ''}" min="0" step="1"
-                   placeholder="${state.data ? Math.floor(state.data.x.length / state.mrioConfig.regionCount) : '自动'}">
+                   placeholder="${state.data ? Math.floor(sectorCount / state.mrioConfig.regionCount) : '自动'}">
           </div>
           <div class="form-group" style="margin-bottom:0">
             <span class="badge ${state.mrioConfig.regionCount > 1 ? 'badge-info' : 'badge-secondary'}">
               ${state.mrioConfig.regionCount > 1 ? 'MRIO 模式' : 'SRIO 模式'}
             </span>
-            ${state.data ? `<span class="text-muted ml-sm">n=${state.data.x.length}</span>` : ''}
+            ${state.data ? `<span class="text-muted ml-sm">n=${sectorCount}</span>` : ''}
           </div>
         </div>
         ${state.mrioConfig.regionCount > 1 ? `
@@ -220,16 +236,17 @@ function renderDataInput(): string {
 
 function renderDataPreview(): string {
   if (!state.data) return '';
-  const n = state.data.x.length;
+  const n = getSectorCount(state.data);
+  const zRows = state.data.Z.length;
+  const zCols = state.data.Z[0]?.length || 0;
   return `
     <div class="card mt-md" style="background: var(--bg-secondary)">
       <h3>📊 数据预览</h3>
       <div class="grid grid-3 mt-md">
-        <div><span class="badge badge-success">Z 矩阵</span> ${n}×${n}</div>
-        <div><span class="badge badge-success">x 向量</span> ${n} 部门</div>
+        <div><span class="badge ${zRows > 0 ? 'badge-success' : 'badge-warning'}">Z 矩阵</span> ${zRows > 0 ? `${zRows}×${zCols}` : '未提供'}</div>
+        <div><span class="badge ${state.data.x.length > 0 ? 'badge-success' : 'badge-warning'}">x 向量</span> ${state.data.x.length > 0 ? `${state.data.x.length} 部门` : '未提供（必需）'}</div>
         ${state.data.Y ? `<div><span class="badge badge-success">Y 矩阵</span> ${n}×${state.data.Y[0]?.length || 0}</div>` : '<div><span class="badge badge-warning">Y</span> 未提供</div>'}
         ${state.data.VA ? `<div><span class="badge badge-success">VA</span> ${state.data.VA.length}×${n}</div>` : '<div><span class="badge badge-warning">VA</span> 未提供</div>'}
-        ${state.data.F ? `<div><span class="badge badge-success">F 卫星</span> ${state.data.F.length}×${n}</div>` : '<div><span class="badge badge-warning">F</span> 未提供</div>'}
         ${state.data.F ? `<div><span class="badge badge-success">F 卫星</span> ${state.data.F.length}×${n}</div>` : '<div><span class="badge badge-warning">F</span> 未提供</div>'}
         <div>部门名称: ${state.data.sectorNames ? '✓ 已加载' : '⚠ 默认'}</div>
         ${state.data.isMRIO ? `<div><span class="badge badge-info">MRIO</span> ${state.data.regions?.length || 0} 个区域</div>` : '<div><span class="badge badge-secondary">单区域</span></div>'}
@@ -241,6 +258,10 @@ function renderDataPreview(): string {
       ` : ''}
     </div>
   `;
+}
+
+function getSectorCount(data: IOData): number {
+  return data.x.length || data.Z.length;
 }
 
 // 步骤2：校验
@@ -354,6 +375,26 @@ function renderCalculation(): string {
       <div class="card-header">
         <h2 class="card-title">⚙️ 计算配置</h2>
       </div>
+
+      ${state.calculationErrors.length > 0 ? `
+        <div class="validation-report validation-fail mb-md">
+          <div class="validation-header">
+            <span class="validation-icon">❌</span>
+            <div>
+              <h3>计算已停止</h3>
+              <p class="text-muted">请修正以下问题后重试</p>
+            </div>
+          </div>
+          <div class="validation-errors">
+            ${state.calculationErrors.map(error => `
+              <div class="validation-error-item">
+                <strong>${error.message}</strong>
+                ${error.details ? `<div class="text-muted mt-sm">${error.details}</div>` : ''}
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      ` : ''}
       
       <div class="grid grid-2">
         <div>
@@ -404,16 +445,18 @@ function renderResults(): string {
   const r = state.results;
   if (!r) return '<div class="loading"><div class="loading-spinner"></div><span>正在计算...</span></div>';
 
-  const tabs = [];
+  const tabs: ResultTab[] = [];
   if (r.A) tabs.push({ id: 'A', label: 'A 直接消耗系数' });
+  if (r.B) tabs.push({ id: 'B', label: 'B 分配系数' });
   if (r.L) tabs.push({ id: 'L', label: 'L Leontief逆' });
   if (r.G) tabs.push({ id: 'G', label: 'G Ghosh逆' });
   if (r.va_coef) tabs.push({ id: 'va', label: '增加值系数' });
   if (r.outputMultiplier) tabs.push({ id: 'mult', label: '乘数' });
   if (r.backwardLinkage) tabs.push({ id: 'linkage', label: '🔗 产业关联' });
-  if (state.data?.isMRIO) tabs.push({ id: 'regions', label: '🌍 区域汇总' });
+  if (state.data?.isMRIO) tabs.push({ id: 'regions', label: '🌍 区域规模' });
   if (r.s) tabs.push({ id: 's', label: 's 卫星强度' });
   if (r.M) tabs.push({ id: 'M', label: 'M 足迹乘数' });
+  if (r.footprint) tabs.push({ id: 'footprint', label: '最终需求足迹' });
 
   return `
     <div class="card">
@@ -454,11 +497,32 @@ function renderResultTable(tabId: string): string {
 
   switch (tabId) {
     case 'A': matrix = r.A; title = 'A 直接消耗系数矩阵'; break;
+    case 'B': matrix = r.B; title = 'B 分配系数矩阵'; break;
     case 'L': matrix = r.L; title = 'L Leontief 逆矩阵'; break;
     case 'G': matrix = r.G; title = 'G Ghosh 供给驱动逆矩阵'; break;
     case 's': matrix = r.s; title = 's 卫星强度矩阵'; break;
     case 'M': matrix = r.M; title = 'M 足迹乘数矩阵'; break;
     case 'va': vector = r.va_coef; title = '增加值系数'; break;
+    case 'footprint': {
+      if (!r.footprint) return '<p class="text-muted">无足迹结果</p>';
+      const rowNames = d.satelliteNames || r.footprint.map((_, i) => `卫星${i + 1}`);
+      const colNames = r.footprint[0]?.length === 1
+        ? ['最终需求合计']
+        : (d.finalDemandNames || r.footprint[0].map((_, i) => `最终需求${i + 1}`));
+      return `
+        <h3>最终需求足迹</h3>
+        <div class="table-container mt-md" style="max-height:400px;overflow:auto">
+          <table class="table">
+            <thead><tr><th>卫星账户</th>${colNames.map(name => `<th>${name}</th>`).join('')}</tr></thead>
+            <tbody>
+              ${r.footprint.map((row, i) => `
+                <tr><td>${rowNames[i]}</td>${row.map(value => `<td class="numeric">${value.toFixed(6)}</td>`).join('')}</tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
     case 'mult':
       return `
         <h3>${title || '乘数'}</h3>
@@ -530,8 +594,7 @@ function renderResultTable(tabId: string): string {
       `;
     case 'regions':
       if (!d.regions || !d.sectorsPerRegion) return '<p>无区域数据</p>';
-      // 简单的区域汇总计算
-      // 注意：这里需要更严谨的计算，暂时只是示例
+      // 对已通过区域维度校验的 MRIO 数据做描述性规模汇总。
       const regionStats = d.regions.map((region, rIdx) => {
         const start = rIdx * d.sectorsPerRegion!;
         const end = start + d.sectorsPerRegion!;
@@ -550,8 +613,8 @@ function renderResultTable(tabId: string): string {
       });
 
       return `
-        <h3>🌍 区域经济汇总</h3>
-        <p class="text-muted mb-md">基于 ${d.regions.length} 个区域的 MRIO 数据汇总。</p>
+        <h3>🌍 区域规模汇总</h3>
+        <p class="text-muted mb-md">基于 ${d.regions.length} 个区域的描述性汇总；不代表双边隐含流、净转移或责任分配结果。</p>
         <div class="table-container mt-md">
           <table class="table">
             <thead>
@@ -716,6 +779,7 @@ function bindEvents(): void {
     state.data = createSampleIOData();
     state.validation = null;
     state.results = null;
+    state.calculationErrors = [];
     updateView();
   });
 
@@ -724,6 +788,7 @@ function bindEvents(): void {
     state.data = null;
     state.validation = null;
     state.results = null;
+    state.calculationErrors = [];
     state.currentStep = 0;
     state.config = { ...DEFAULT_CONFIG };
     updateView();
@@ -857,6 +922,7 @@ function bindEvents(): void {
       const key = (e.target as HTMLInputElement).getAttribute('data-config') as keyof CalculationConfig;
       if (key) {
         (state.config as unknown as Record<string, boolean>)[key] = (e.target as HTMLInputElement).checked;
+        state.calculationErrors = [];
       }
     });
   });
@@ -864,6 +930,7 @@ function bindEvents(): void {
   // 容差输入
   document.getElementById('tolerance')?.addEventListener('change', (e) => {
     state.config.tolerance = parseFloat((e.target as HTMLInputElement).value) || 1e-6;
+    state.calculationErrors = [];
   });
 
   // Tab 切换
@@ -972,6 +1039,10 @@ function applyMrioConfig(): void {
     state.data.regions = undefined;
     state.data.sectorsPerRegion = undefined;
   }
+
+  state.validation = null;
+  state.results = null;
+  state.calculationErrors = [];
 }
 
 // 关闭 Sheet 选择模态框
@@ -989,7 +1060,6 @@ async function handleFile(file: File): Promise<void> {
   try {
     // Excel 文件：显示 Sheet 选择模态框
     if (ext === 'xlsx' || ext === 'xls') {
-      const { readExcelFile } = await import('./utils/fileIO');
       const result = await readExcelFile(file);
 
       if (result.error) {
@@ -1016,7 +1086,6 @@ async function handleFile(file: File): Promise<void> {
     }
 
     // 其他格式：直接处理
-    const { readMatrixFile } = await import('./utils/fileIO');
     const result = await readMatrixFile(file);
 
     if (result.error) {
@@ -1040,13 +1109,13 @@ async function handleFile(file: File): Promise<void> {
 
       if (name.includes('z') || name.includes('intermediate') || name.includes('中间')) {
         state.data.Z = mat.data;
-        if (mat.data.length > 0 && mat.data.length === mat.data[0]?.length) {
-          if (!state.data.x || state.data.x.length === 0) {
-            state.data.x = mat.data.map(row => row.reduce((s, v) => s + v, 0) * 2);
-          }
-        }
       } else if (name.includes('x') || name.includes('output') || name.includes('产出')) {
-        state.data.x = mat.data.length === 1 ? mat.data[0] : mat.data.map(r => r[0]);
+        const vector = matrixToVector(mat.data);
+        if (!vector) {
+          alert(`矩阵 "${mat.name}" 不能作为 x：总产出必须是一行或一列`);
+          continue;
+        }
+        state.data.x = vector;
       } else if (name.includes('y') || name.includes('final') || name.includes('需求')) {
         state.data.Y = mat.data;
       } else if (name.includes('va') || name.includes('value') || name.includes('增加值')) {
@@ -1059,10 +1128,10 @@ async function handleFile(file: File): Promise<void> {
 
         if (rows === cols && rows > 1 && !state.data.Z.length) {
           state.data.Z = mat.data;
-          state.data.x = mat.data.map(row => row.reduce((s, v) => s + v, 0) * 2);
         } else if (rows === 1 || cols === 1) {
           if (!state.data.x.length) {
-            state.data.x = rows === 1 ? mat.data[0] : mat.data.map(r => r[0]);
+            const vector = matrixToVector(mat.data);
+            if (vector) state.data.x = vector;
           }
         }
       }
@@ -1076,6 +1145,9 @@ async function handleFile(file: File): Promise<void> {
       alert(`文件 "${file.name}" 已加载 ${result.matrices.length} 个矩阵。\n请检查数据并通过粘贴功能补充缺失的 Z 或 x 数据。`);
     }
 
+    state.validation = null;
+    state.results = null;
+    state.calculationErrors = [];
     updateView();
   } catch (e) {
     alert(`文件处理失败：${e instanceof Error ? e.message : '未知错误'}`);
@@ -1086,87 +1158,136 @@ async function handleFile(file: File): Promise<void> {
 function handleSheetImport(): void {
   const hasHeaders = (document.getElementById('modal-has-headers') as HTMLInputElement)?.checked ?? true;
   const selects = document.querySelectorAll('.sheet-type-select') as NodeListOf<HTMLSelectElement>;
+  const imported: Partial<IOData> = {};
+  const importErrors: string[] = [];
 
-  if (!state.data) {
-    state.data = { Z: [], x: [] };
-  }
-
-  selects.forEach((select, idx) => {
+  Array.from(selects).forEach((select, idx) => {
     const type = select.value;
     const sheet = state.excelSheets[idx];
     if (!type || !sheet) return;
 
-    const skipRow = hasHeaders;
-    const skipCol = hasHeaders && type !== 'x' && type !== 'sectors';
-
-    const { matrix, rowNames, colNames } = parseNumericMatrix(sheet.data, skipRow, skipCol);
-
     switch (type) {
-      case 'Z':
-        state.data!.Z = matrix;
+      case 'Z': {
+        const parsed = parseNumericMatrix(sheet.data, hasHeaders, hasHeaders);
+        if (parsed.errors.length > 0) {
+          importErrors.push(`${sheet.name}: ${formatMatrixParseErrors(parsed.errors)}`);
+          break;
+        }
+        imported.Z = parsed.matrix;
+        const { rowNames, colNames } = parsed;
         if (rowNames && rowNames.length > 0) {
-          state.data!.sectorNames = rowNames;
+          imported.sectorNames = rowNames;
         } else if (colNames && colNames.length > 0) {
-          state.data!.sectorNames = colNames;
+          imported.sectorNames = colNames;
         }
         break;
-      case 'x':
-        state.data!.x = matrix.length === 1 ? matrix[0] : matrix.map((r: number[]) => r[0]);
+      }
+      case 'x': {
+        const parsed = parseNumericVector(sheet.data, hasHeaders);
+        if (parsed.errors.length > 0) {
+          importErrors.push(`${sheet.name}: ${formatMatrixParseErrors(parsed.errors)}`);
+          break;
+        }
+        imported.x = parsed.vector;
         break;
-      case 'Y':
-        state.data!.Y = matrix;
-        if (colNames) state.data!.finalDemandNames = colNames;
+      }
+      case 'Y': {
+        const parsed = parseNumericMatrix(sheet.data, hasHeaders, hasHeaders);
+        if (parsed.errors.length > 0) {
+          importErrors.push(`${sheet.name}: ${formatMatrixParseErrors(parsed.errors)}`);
+          break;
+        }
+        imported.Y = parsed.matrix;
+        if (parsed.colNames) imported.finalDemandNames = parsed.colNames;
         break;
-      case 'VA':
-        state.data!.VA = matrix;
-        if (rowNames) state.data!.valueAddedNames = rowNames;
+      }
+      case 'VA': {
+        const parsed = parseNumericMatrix(sheet.data, hasHeaders, hasHeaders);
+        if (parsed.errors.length > 0) {
+          importErrors.push(`${sheet.name}: ${formatMatrixParseErrors(parsed.errors)}`);
+          break;
+        }
+        imported.VA = parsed.matrix;
+        if (parsed.rowNames) imported.valueAddedNames = parsed.rowNames;
         break;
-      case 'F':
-        state.data!.F = matrix;
-        if (rowNames) state.data!.satelliteNames = rowNames;
+      }
+      case 'F': {
+        const parsed = parseNumericMatrix(sheet.data, hasHeaders, hasHeaders);
+        if (parsed.errors.length > 0) {
+          importErrors.push(`${sheet.name}: ${formatMatrixParseErrors(parsed.errors)}`);
+          break;
+        }
+        imported.F = parsed.matrix;
+        if (parsed.rowNames) imported.satelliteNames = parsed.rowNames;
         break;
-      case 'sectors':
+      }
+      case 'sectors': {
         // 部门名称列表：取第一列或第一行
         const names = sheet.data
           .slice(hasHeaders ? 1 : 0)
           .map(row => row[0]?.toString() || '')
           .filter(n => n);
         if (names.length > 0) {
-          state.data!.sectorNames = names;
+          imported.sectorNames = names;
         }
         break;
-      case 'regions':
+      }
+      case 'regions': {
         // 区域名称列表：取第一列或第一行
         const regionNames = sheet.data
           .slice(hasHeaders ? 1 : 0)
           .map(row => row[0]?.toString() || '')
           .filter(n => n);
         if (regionNames.length > 0) {
-          state.data!.regions = regionNames;
-          state.data!.isMRIO = true;
-          state.mrioConfig.regionCount = regionNames.length;
-          // sectorsPerRegion保持为0，让UI动态显示 n/regionCount
-          state.mrioConfig.sectorsPerRegion = 0;
-          // 但data上的sectorsPerRegion需要计算实际值
-          if (state.data!.x.length > 0) {
-            state.data!.sectorsPerRegion = Math.floor(state.data!.x.length / regionNames.length);
-          }
+          imported.regions = regionNames;
+          imported.isMRIO = regionNames.length > 1;
         }
         break;
+      }
     }
   });
+
+  if (importErrors.length > 0) {
+    alert(`导入已停止，请修正以下问题：\n${importErrors.join('\n')}`);
+    return;
+  }
+
+  const existing = state.data || { Z: [], x: [] };
+  const nextData: IOData = {
+    ...existing,
+    ...imported,
+    Z: imported.Z || existing.Z,
+    x: imported.x || existing.x
+  };
+
+  if (nextData.isMRIO && nextData.regions) {
+    const regionCount = nextData.regions.length;
+    const sectorsPerRegion = regionCount > 0 && nextData.x.length % regionCount === 0
+      ? nextData.x.length / regionCount
+      : 0;
+    nextData.sectorsPerRegion = sectorsPerRegion;
+    state.mrioConfig = { regionCount, sectorsPerRegion };
+  }
+
+  state.data = nextData;
+  state.validation = null;
+  state.results = null;
+  state.calculationErrors = [];
 
   // 关闭模态框
   state.showSheetModal = false;
   state.excelSheets = [];
   state.pendingFile = null;
 
-  // 如果有 Z 但没有 x，尝试估算
-  if (state.data.Z.length > 0 && (!state.data.x || state.data.x.length === 0)) {
-    state.data.x = state.data.Z.map(row => row.reduce((s, v) => s + v, 0) * 2);
-  }
-
   updateView();
+}
+
+function matrixToVector(matrix: number[][]): number[] | null {
+  if (matrix.length === 1) return matrix[0];
+  if (matrix.length > 0 && matrix.every(row => row.length === 1)) {
+    return matrix.map(row => row[0]);
+  }
+  return null;
 }
 
 // 粘贴处理
@@ -1181,21 +1302,27 @@ function handlePaste(): void {
   }
 
   const { data } = parseClipboardMatrix(textarea.value);
-  const { matrix, rowNames, colNames } = parseNumericMatrix(data, hasHeaders, hasHeaders);
+  const type = typeSelect.value;
+  const parsed = type === 'x'
+    ? parseNumericVector(data, hasHeaders)
+    : parseNumericMatrix(data, hasHeaders, hasHeaders);
+  if (parsed.errors.length > 0) {
+    alert(`解析失败：${formatMatrixParseErrors(parsed.errors)}`);
+    return;
+  }
+  const { matrix, rowNames, colNames } = parsed;
 
   if (!state.data) {
     state.data = { Z: [], x: [] };
   }
 
-  const type = typeSelect.value;
   switch (type) {
     case 'Z':
       state.data.Z = matrix;
       if (rowNames) state.data.sectorNames = rowNames;
       break;
     case 'x':
-      // x 向量：无论是行向量还是列向量，都转换为一维数组
-      state.data.x = matrix.length === 1 ? matrix[0] : matrix.map(r => r[0]);
+      state.data.x = (parsed as ReturnType<typeof parseNumericVector>).vector;
       break;
     case 'Y':
       state.data.Y = matrix;
@@ -1211,6 +1338,9 @@ function handlePaste(): void {
       break;
   }
 
+  state.validation = null;
+  state.results = null;
+  state.calculationErrors = [];
   textarea.value = '';
   updateView();
 }
@@ -1219,13 +1349,27 @@ function handlePaste(): void {
 function runCalculation(): void {
   if (!state.data) return;
 
-  const { results, errors } = calculateIOIndicators(state.data, state.config);
-  state.results = results;
-
-  if (errors.length > 0) {
-    console.warn('计算警告:', errors);
+  state.validation = validateIOData(state.data, state.config.tolerance);
+  if (state.validation.status === 'fail') {
+    state.results = null;
+    state.calculationErrors = state.validation.errors
+      .filter(error => error.severity === 'error')
+      .map(error => ({ code: error.code, message: error.message, details: error.details }));
+    state.currentStep = 1;
+    updateView();
+    return;
   }
 
+  const { results, errors } = calculateIOIndicators(state.data, state.config);
+  if (errors.length > 0) {
+    state.results = null;
+    state.calculationErrors = errors;
+    updateView();
+    return;
+  }
+
+  state.results = results;
+  state.calculationErrors = [];
   state.currentStep = 3;
   updateView();
 }
