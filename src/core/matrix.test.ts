@@ -9,6 +9,8 @@ describe('matrixInverse', () => {
         expect(result.error).toBeNull();
         expect(result.matrix?.[0][0]).toBeCloseTo(2, 12);
         expect(result.matrix?.[39][39]).toBeCloseTo(2, 12);
+        expect(result.conditionEstimate).toBeCloseTo(1, 12);
+        expect(result.inverseResidual).toBeCloseTo(0, 12);
     });
 
     it('rejects a singular matrix', () => {

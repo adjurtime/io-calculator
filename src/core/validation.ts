@@ -4,7 +4,7 @@
  */
 
 import type { IOData, ValidationResult, ValidationError } from '../types/io';
-import { getMatrixSize, isSquare, rowSum, colSum, vectorSubtract } from './matrix';
+import { MAX_BROWSER_SECTORS } from './limits';
 
 /**
  * 执行完整的数据校验
@@ -117,6 +117,14 @@ function validateDimensions(data: IOData, n: number, errors: ValidationError[]):
         });
     } else {
         validateFiniteVector(data.x, 'x', errors);
+        if (n > MAX_BROWSER_SECTORS) {
+            errors.push({
+                code: 'BROWSER_SIZE_LIMIT',
+                severity: 'error',
+                message: `浏览器版本最多支持 ${MAX_BROWSER_SECTORS} 个部门`,
+                details: `当前数据包含 ${n} 个部门。大型 MRIO 请使用后端或稀疏计算流程。`
+            });
+        }
     }
 
     if (data.Z.length === 0) {
@@ -471,4 +479,34 @@ function checkAccountingIdentity(
     }
 
     return { errors, maxError, meanError };
+}
+
+function getMatrixSize(matrix: number[][]): { rows: number; cols: number } {
+    return {
+        rows: matrix.length,
+        cols: matrix[0]?.length || 0
+    };
+}
+
+function isSquare(matrix: number[][]): boolean {
+    return matrix.length > 0 && matrix.every(row => row.length === matrix.length);
+}
+
+function rowSum(matrix: number[][]): number[] {
+    return matrix.map(row => row.reduce((sum, value) => sum + value, 0));
+}
+
+function colSum(matrix: number[][]): number[] {
+    const cols = matrix[0]?.length || 0;
+    const sums = Array(cols).fill(0) as number[];
+    for (const row of matrix) {
+        for (let col = 0; col < cols; col++) {
+            sums[col] += row[col];
+        }
+    }
+    return sums;
+}
+
+function vectorSubtract(left: number[], right: number[]): number[] {
+    return left.map((value, index) => value - right[index]);
 }

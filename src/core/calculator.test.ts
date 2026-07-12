@@ -54,6 +54,8 @@ describe('calculateIOIndicators', () => {
         expect(results.footprint?.[0]).toHaveLength(1);
         expect(results.footprint?.[0][0]).toBeCloseTo(30, 10);
         expect(results.footprint?.[1][0]).toBeCloseTo(150, 10);
+        expect(results.numericDiagnostics?.leontief?.conditionEstimate).toBeGreaterThanOrEqual(1);
+        expect(results.numericDiagnostics?.leontief?.inverseResidual).toBeLessThan(1e-10);
     });
 
     it('computes footprint dependencies even when A, L, s, and M are not requested for display', () => {

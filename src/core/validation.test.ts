@@ -53,4 +53,14 @@ describe('validateIOData', () => {
         expect(result.status).toBe('fail');
         expect(result.errors.map(error => error.code)).toContain('MRIO_DIMENSION_MISMATCH');
     });
+
+    it('blocks systems above the browser alpha size limit', () => {
+        const n = 501;
+        const result = validateIOData({
+            Z: Array.from({ length: n }, () => Array(n).fill(0)),
+            x: Array(n).fill(1)
+        });
+        expect(result.status).toBe('fail');
+        expect(result.errors.map(error => error.code)).toContain('BROWSER_SIZE_LIMIT');
+    });
 });

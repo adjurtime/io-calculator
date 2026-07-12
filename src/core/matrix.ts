@@ -11,6 +11,13 @@ const math = create(all, {
     precision: 64
 });
 
+export interface MatrixInverseResult {
+    matrix: number[][] | null;
+    error: string | null;
+    inverseResidual?: number;
+    conditionEstimate?: number;
+}
+
 /**
  * 创建 n×n 单位矩阵
  */
@@ -108,7 +115,7 @@ export function matrixAdd(A: number[][], B: number[][]): number[][] {
  * 矩阵求逆
  * 返回逆矩阵或错误信息
  */
-export function matrixInverse(A: number[][]): { matrix: number[][] | null; error: string | null } {
+export function matrixInverse(A: number[][]): MatrixInverseResult {
     try {
         const n = A.length;
         if (n === 0 || A.some(row => row.length !== n)) {
@@ -153,13 +160,26 @@ export function matrixInverse(A: number[][]): { matrix: number[][] | null; error
             };
         }
 
-        return { matrix: inverse, error: null };
+        const conditionEstimate = matrixInfinityNorm(A) * matrixInfinityNorm(inverse);
+        return {
+            matrix: inverse,
+            error: null,
+            inverseResidual: maxResidual,
+            conditionEstimate
+        };
     } catch (e) {
         return {
             matrix: null,
             error: `矩阵求逆失败：${e instanceof Error ? e.message : '未知错误'}`
         };
     }
+}
+
+function matrixInfinityNorm(matrix: number[][]): number {
+    return matrix.reduce((max, row) => {
+        const rowSum = row.reduce((sum, value) => sum + Math.abs(value), 0);
+        return Math.max(max, rowSum);
+    }, 0);
 }
 
 /**

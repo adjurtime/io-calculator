@@ -20,6 +20,7 @@ import {
     colSum
 } from './matrix';
 import { validateIOData } from './validation';
+import { CONDITION_WARNING_THRESHOLD } from './limits';
 
 /**
  * 执行 IO 指标计算
@@ -43,7 +44,8 @@ export function calculateIOIndicators(
                 .map(error => ({
                     code: error.code,
                     message: error.message,
-                    details: error.details
+                    details: error.details,
+                    severity: 'error'
                 }))
         };
     }
@@ -53,7 +55,8 @@ export function calculateIOIndicators(
             results,
             errors: [{
                 code: 'FOOTPRINT_REQUIRES_FINAL_DEMAND',
-                message: '计算最终需求足迹必须提供 Y 矩阵'
+                message: '计算最终需求足迹必须提供 Y 矩阵',
+                severity: 'error'
             }]
         };
     }
@@ -70,7 +73,8 @@ export function calculateIOIndicators(
             results,
             errors: [{
                 code: 'ZERO_OUTPUT',
-                message: '总产出向量包含零值，计算已停止'
+                message: '总产出向量包含零值，计算已停止',
+                severity: 'error'
             }]
         };
     }
@@ -113,6 +117,21 @@ export function calculateIOIndicators(
             });
         } else {
             L = invResult.matrix!;
+            results.numericDiagnostics = {
+                ...results.numericDiagnostics,
+                leontief: {
+                    inverseResidual: invResult.inverseResidual || 0,
+                    conditionEstimate: invResult.conditionEstimate || 0
+                }
+            };
+            if ((invResult.conditionEstimate || 0) > CONDITION_WARNING_THRESHOLD) {
+                errors.push({
+                    code: 'LEONTIEF_ILL_CONDITIONED',
+                    message: 'Leontief 系统可能病态，结果对输入误差较敏感',
+                    details: `无穷范数条件估计约为 ${(invResult.conditionEstimate || 0).toExponential(4)}`,
+                    severity: 'warning'
+                });
+            }
             if (config.computeL) {
                 results.L = L;
 
@@ -143,6 +162,21 @@ export function calculateIOIndicators(
             });
         } else {
             G = ghoshResult.matrix!;
+            results.numericDiagnostics = {
+                ...results.numericDiagnostics,
+                ghosh: {
+                    inverseResidual: ghoshResult.inverseResidual || 0,
+                    conditionEstimate: ghoshResult.conditionEstimate || 0
+                }
+            };
+            if ((ghoshResult.conditionEstimate || 0) > CONDITION_WARNING_THRESHOLD) {
+                errors.push({
+                    code: 'GHOSH_ILL_CONDITIONED',
+                    message: 'Ghosh 系统可能病态，结果对输入误差较敏感',
+                    details: `无穷范数条件估计约为 ${(ghoshResult.conditionEstimate || 0).toExponential(4)}`,
+                    severity: 'warning'
+                });
+            }
             if (config.computeG) {
                 results.G = G;
             }

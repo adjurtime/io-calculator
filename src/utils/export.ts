@@ -263,6 +263,19 @@ function addLogSheet(
         logData.push(['计算足迹乘数 M', results.config.computeM ? '是' : '否']);
     }
 
+    if (results.numericDiagnostics) {
+        logData.push(['']);
+        logData.push(['数值诊断']);
+        if (results.numericDiagnostics.leontief) {
+            logData.push(['Leontief 条件估计', results.numericDiagnostics.leontief.conditionEstimate]);
+            logData.push(['Leontief 逆矩阵残差', results.numericDiagnostics.leontief.inverseResidual]);
+        }
+        if (results.numericDiagnostics.ghosh) {
+            logData.push(['Ghosh 条件估计', results.numericDiagnostics.ghosh.conditionEstimate]);
+            logData.push(['Ghosh 逆矩阵残差', results.numericDiagnostics.ghosh.inverseResidual]);
+        }
+    }
+
     if (data.metadata) {
         logData.push(['']);
         logData.push(['元数据']);
@@ -320,7 +333,7 @@ export function exportResultsToJSON(
     validation?: ValidationResult
 ): void {
     const exportData = {
-        version: '2.0-alpha.1',
+        version: '2.0-alpha.2',
         exportedAt: new Date().toISOString(),
         metadata: data.metadata,
         dimensions: {

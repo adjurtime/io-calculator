@@ -3,10 +3,10 @@
  */
 
 import './index.css';
-import type { IOData, CalculationConfig, CalculationError, CalculationResults, ValidationResult } from './types/io';
+import type { IOData, CalculationConfig, CalculationError, CalculationResults, MatrixDiagnostic, ValidationResult } from './types/io';
 import { DEFAULT_CONFIG } from './types/io';
 import { validateIOData } from './core/validation';
-import { calculateIOIndicators } from './core/calculator';
+import { MAX_HEATMAP_DIMENSION, MAX_RENDER_DIMENSION } from './core/limits';
 import {
   createSampleIOData,
   formatMatrixParseErrors,
@@ -17,6 +17,8 @@ import {
   readMatrixFile
 } from './utils/fileIO';
 import { exportResultsToExcel, exportResultsToJSON } from './utils/export';
+import { escapeHTML } from './utils/html';
+import type { CalculationWorkerRequest, CalculationWorkerResponse } from './workers/protocol';
 
 // ECharts type declaration
 declare const echarts: any;
@@ -41,6 +43,8 @@ interface AppState {
   config: CalculationConfig;
   results: CalculationResults | null;
   calculationErrors: CalculationError[];
+  calculationWarnings: CalculationError[];
+  isCalculating: boolean;
   // Excel Sheet 选择相关
   excelSheets: ExcelSheetInfo[];
   showSheetModal: boolean;
@@ -62,6 +66,8 @@ const state: AppState = {
   config: { ...DEFAULT_CONFIG },
   results: null,
   calculationErrors: [],
+  calculationWarnings: [],
+  isCalculating: false,
   excelSheets: [],
   showSheetModal: false,
   pendingFile: null,
@@ -72,6 +78,11 @@ const state: AppState = {
     sectorsPerRegion: 0  // 0 表示自动（等于矩阵维度n）
   }
 };
+
+let calculationWorker: Worker | null = null;
+let calculationRequestId = 0;
+let activeHeatmap: any = null;
+let heatmapResizeHandler: (() => void) | null = null;
 
 // 权威数据库链接
 const IO_DATABASES = [
@@ -131,10 +142,10 @@ function renderSteps(): string {
   return `
     <nav class="steps">
       ${steps.map((label, i) => `
-        <div class="step ${i === state.currentStep ? 'active' : ''} ${i < state.currentStep ? 'completed' : ''}" data-step="${i}">
-          <div class="step-number">${i < state.currentStep ? '✓' : i + 1}</div>
+        <button type="button" class="step ${i === state.currentStep ? 'active' : ''} ${i < state.currentStep ? 'completed' : ''}" data-step="${i}" ${i === state.currentStep ? 'aria-current="step"' : ''} ${i > state.currentStep ? 'disabled' : ''}>
+          <span class="step-number">${i < state.currentStep ? '✓' : i + 1}</span>
           <span class="step-label">${label}</span>
-        </div>
+        </button>
       `).join('')}
     </nav>
   `;
@@ -160,18 +171,18 @@ function renderDataInput(): string {
       </div>
       
       <div class="grid grid-2">
-        <div class="upload-zone" id="upload-zone">
-          <div class="upload-zone-icon">📁</div>
-          <div class="upload-zone-text">拖拽文件到此处，或点击上传</div>
-          <div class="upload-zone-hint">支持 Excel (.xlsx)、CSV、TXT、DAT、MAT 格式</div>
-          <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.txt,.dat,.mat" style="display:none">
-        </div>
+        <button type="button" class="upload-zone" id="upload-zone" aria-controls="file-input">
+          <span class="upload-zone-icon">📁</span>
+          <span class="upload-zone-text">拖拽文件到此处，或点击上传</span>
+          <span class="upload-zone-hint">支持 Excel (.xlsx)、CSV、TXT、DAT、MAT 格式</span>
+        </button>
+        <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.txt,.dat,.mat" class="sr-only" tabindex="-1" aria-hidden="true">
         
         <div class="card" style="margin:0">
           <h3>📋 从 Excel 粘贴</h3>
           <p class="text-muted mb-md">从 Excel 复制矩阵数据，粘贴到下方</p>
           <div class="form-group">
-            <label class="form-label">选择数据类型</label>
+            <label class="form-label" for="paste-type">选择数据类型</label>
             <select class="form-select" id="paste-type">
               <option value="Z">Z - 中间投入矩阵</option>
               <option value="x">x - 总产出向量</option>
@@ -196,12 +207,12 @@ function renderDataInput(): string {
         <p class="text-muted mb-md">手动设置区域数量和每区域部门数（SRIO 模式设置区域数为 1）</p>
         <div class="grid grid-3" style="align-items: end;">
           <div class="form-group" style="margin-bottom:0">
-            <label class="form-label">区域数量</label>
+            <label class="form-label" for="mrio-region-count">区域数量</label>
             <input type="number" class="form-input" id="mrio-region-count" 
                    value="${state.mrioConfig.regionCount}" min="1" step="1">
           </div>
           <div class="form-group" style="margin-bottom:0">
-            <label class="form-label">每区域部门数 ${state.data ? `<span class="text-muted">(默认=${Math.floor(sectorCount / state.mrioConfig.regionCount)})</span>` : ''}</label>
+            <label class="form-label" for="mrio-sectors-per-region">每区域部门数 ${state.data ? `<span class="text-muted">(默认=${Math.floor(sectorCount / state.mrioConfig.regionCount)})</span>` : ''}</label>
             <input type="number" class="form-input" id="mrio-sectors-per-region" 
                    value="${state.mrioConfig.sectorsPerRegion || ''}" min="0" step="1"
                    placeholder="${state.data ? Math.floor(sectorCount / state.mrioConfig.regionCount) : '自动'}">
@@ -215,9 +226,9 @@ function renderDataInput(): string {
         </div>
         ${state.mrioConfig.regionCount > 1 ? `
         <div class="form-group mt-md">
-          <label class="form-label">区域名称 <span class="text-muted">(每行一个，留空使用默认名称)</span></label>
+          <label class="form-label" for="mrio-region-names">区域名称 <span class="text-muted">(每行一个，留空使用默认名称)</span></label>
           <textarea class="form-textarea" id="mrio-region-names" rows="3" 
-                    placeholder="Region 1\nRegion 2\n...">${state.data?.regions?.join('\n') || ''}</textarea>
+                    placeholder="Region 1\nRegion 2\n...">${state.data?.regions?.map(escapeHTML).join('\n') || ''}</textarea>
         </div>
         ` : ''}
       </div>
@@ -253,7 +264,7 @@ function renderDataPreview(): string {
       </div>
       ${state.data.isMRIO && state.data.regions ? `
         <div class="mt-md text-sm text-muted">
-          <strong>识别到的区域：</strong> ${state.data.regions.join('、')}
+          <strong>识别到的区域：</strong> ${state.data.regions.map(escapeHTML).join('、')}
         </div>
       ` : ''}
     </div>
@@ -282,7 +293,7 @@ function renderValidation(): string {
           <div class="validation-header">
             <span class="validation-icon">${statusIcon}</span>
             <div>
-              <h3>${v.summary}</h3>
+              <h3>${escapeHTML(v.summary)}</h3>
               <p class="text-muted">共 ${v.errors.length} 个提示</p>
             </div>
           </div>
@@ -292,8 +303,8 @@ function renderValidation(): string {
               ${v.errors.map(e => `
                 <div class="validation-error-item">
                   <span class="badge badge-${e.severity === 'error' ? 'error' : e.severity === 'warning' ? 'warning' : 'info'}">${e.severity}</span>
-                  <strong>${e.message}</strong>
-                  ${e.details ? `<div class="text-muted" style="margin-top:4px;white-space:pre-wrap;font-family:var(--font-mono);font-size:0.85em">${e.details}</div>` : ''}
+                  <strong>${escapeHTML(e.message)}</strong>
+                  ${e.details ? `<div class="text-muted" style="margin-top:4px;white-space:pre-wrap;font-family:var(--font-mono);font-size:0.85em">${escapeHTML(e.details)}</div>` : ''}
                 </div>
               `).join('')}
             </div>
@@ -377,7 +388,7 @@ function renderCalculation(): string {
       </div>
 
       ${state.calculationErrors.length > 0 ? `
-        <div class="validation-report validation-fail mb-md">
+        <div class="validation-report validation-fail mb-md" role="alert">
           <div class="validation-header">
             <span class="validation-icon">❌</span>
             <div>
@@ -388,8 +399,8 @@ function renderCalculation(): string {
           <div class="validation-errors">
             ${state.calculationErrors.map(error => `
               <div class="validation-error-item">
-                <strong>${error.message}</strong>
-                ${error.details ? `<div class="text-muted mt-sm">${error.details}</div>` : ''}
+                <strong>${escapeHTML(error.message)}</strong>
+                ${error.details ? `<div class="text-muted mt-sm">${escapeHTML(error.details)}</div>` : ''}
               </div>
             `).join('')}
           </div>
@@ -424,7 +435,7 @@ function renderCalculation(): string {
           
           <h3 class="mt-md">参数设置</h3>
           <div class="form-group mt-md">
-            <label class="form-label">容差 ε</label>
+            <label class="form-label" for="tolerance">容差 ε</label>
             <input type="number" class="form-input" id="tolerance" value="${c.tolerance}" step="0.000001">
           </div>
         </div>
@@ -432,9 +443,14 @@ function renderCalculation(): string {
       
       <div class="flex-between mt-md">
         <button class="btn btn-secondary" id="btn-prev-3">← 返回</button>
-        <button class="btn btn-primary btn-lg" id="btn-calculate">
-          🚀 运行计算
-        </button>
+        ${state.isCalculating ? `
+          <div class="flex gap-md" role="status" aria-live="polite">
+            <span class="loading"><span class="loading-spinner"></span>正在后台计算…</span>
+            <button class="btn btn-secondary" id="btn-cancel-calculation">取消计算</button>
+          </div>
+        ` : `
+          <button class="btn btn-primary btn-lg" id="btn-calculate">🚀 运行计算</button>
+        `}
       </div>
     </div>
   `;
@@ -467,12 +483,34 @@ function renderResults(): string {
           <button class="btn btn-secondary" id="btn-export-json">📄 导出 JSON</button>
         </div>
       </div>
+
+      ${state.calculationWarnings.length > 0 ? `
+        <div class="validation-report validation-warning mb-md" role="status">
+          <strong>数值诊断提示</strong>
+          ${state.calculationWarnings.map(issue => `
+            <p class="mt-sm">${escapeHTML(issue.message)}${issue.details ? `：${escapeHTML(issue.details)}` : ''}</p>
+          `).join('')}
+        </div>
+      ` : ''}
+
+      ${r.numericDiagnostics ? `
+        <div class="card mb-md" style="background: var(--bg-secondary); margin-bottom: 16px;">
+          <h3>数值诊断</h3>
+          <div class="grid grid-2 mt-sm">
+            ${renderNumericDiagnostic('Leontief', r.numericDiagnostics.leontief)}
+            ${renderNumericDiagnostic('Ghosh', r.numericDiagnostics.ghosh)}
+          </div>
+        </div>
+      ` : ''}
       
-      <div class="tabs">
-        ${tabs.map((t) => `<button class="tab ${t.id === (state.activeResultTab || tabs[0]?.id) ? 'active' : ''}" data-tab="${t.id}">${t.label}</button>`).join('')}
+      <div class="tabs" role="tablist" aria-label="计算结果">
+        ${tabs.map((t) => {
+          const active = t.id === (state.activeResultTab || tabs[0]?.id);
+          return `<button class="tab ${active ? 'active' : ''}" role="tab" aria-selected="${active}" aria-controls="result-content" tabindex="${active ? '0' : '-1'}" data-tab="${t.id}">${t.label}</button>`;
+        }).join('')}
       </div>
       
-      <div id="result-content">
+      <div id="result-content" role="tabpanel">
         ${renderResultTable(state.activeResultTab || tabs[0]?.id || 'A')}
       </div>
       
@@ -480,6 +518,20 @@ function renderResults(): string {
         <button class="btn btn-secondary" id="btn-prev-4">← 返回修改配置</button>
         <p class="text-muted">计算完成于 ${r.timestamp ? new Date(r.timestamp).toLocaleString() : '-'}</p>
       </div>
+    </div>
+  `;
+}
+
+function renderNumericDiagnostic(
+  name: string,
+  diagnostic: MatrixDiagnostic | undefined
+): string {
+  if (!diagnostic) return '';
+  return `
+    <div>
+      <strong>${name}</strong>
+      <p class="text-muted text-sm">条件估计：${diagnostic.conditionEstimate.toExponential(4)}</p>
+      <p class="text-muted text-sm">逆矩阵残差：${diagnostic.inverseResidual.toExponential(4)}</p>
     </div>
   `;
 }
@@ -513,10 +565,10 @@ function renderResultTable(tabId: string): string {
         <h3>最终需求足迹</h3>
         <div class="table-container mt-md" style="max-height:400px;overflow:auto">
           <table class="table">
-            <thead><tr><th>卫星账户</th>${colNames.map(name => `<th>${name}</th>`).join('')}</tr></thead>
+            <thead><tr><th>卫星账户</th>${colNames.map(name => `<th>${escapeHTML(name)}</th>`).join('')}</tr></thead>
             <tbody>
               ${r.footprint.map((row, i) => `
-                <tr><td>${rowNames[i]}</td>${row.map(value => `<td class="numeric">${value.toFixed(6)}</td>`).join('')}</tr>
+                <tr><td>${escapeHTML(rowNames[i])}</td>${row.map(value => `<td class="numeric">${value.toFixed(6)}</td>`).join('')}</tr>
               `).join('')}
             </tbody>
           </table>
@@ -532,7 +584,7 @@ function renderResultTable(tabId: string): string {
             <tbody>
               ${names.map((n, i) => `
                 <tr>
-                  <td>${n}</td>
+                  <td>${escapeHTML(n)}</td>
                   <td class="numeric">${r.outputMultiplier?.[i]?.toFixed(4) || '-'}</td>
                   ${r.vaMultiplier ? `<td class="numeric">${r.vaMultiplier[i]?.toFixed(4) || '-'}</td>` : ''}
                 </tr>
@@ -580,7 +632,7 @@ function renderResultTable(tabId: string): string {
         }
         return `
                 <tr>
-                  <td>${n}</td>
+                  <td>${escapeHTML(n)}</td>
                   <td class="numeric">${r.backwardLinkage?.[i]?.toFixed(4) || '-'}</td>
                   <td class="numeric">${r.forwardLinkage?.[i]?.toFixed(4) || '-'}</td>
                   <td class="numeric">${bl.toFixed(4)}</td>
@@ -628,7 +680,7 @@ function renderResultTable(tabId: string): string {
             <tbody>
               ${regionStats.map(s => `
                 <tr>
-                  <td><strong>${s.region}</strong></td>
+                  <td><strong>${escapeHTML(s.region)}</strong></td>
                   <td class="numeric">${s.totalX.toFixed(2)}</td>
                   <td class="numeric">${s.totalVA.toFixed(2)}</td>
                   <td class="numeric">${s.totalX ? (s.totalVA / s.totalX * 100).toFixed(2) + '%' : '-'}</td>
@@ -646,7 +698,7 @@ function renderResultTable(tabId: string): string {
       <div class="table-container mt-md" style="max-height:400px;overflow:auto">
         <table class="table">
           <thead><tr><th>部门</th><th>值</th></tr></thead>
-          <tbody>${names.map((n, i) => `<tr><td>${n}</td><td class="numeric">${vector![i]?.toFixed(6) || '-'}</td></tr>`).join('')}</tbody>
+          <tbody>${names.map((n, i) => `<tr><td>${escapeHTML(n)}</td><td class="numeric">${vector![i]?.toFixed(6) || '-'}</td></tr>`).join('')}</tbody>
         </table>
       </div>
     `;
@@ -654,6 +706,13 @@ function renderResultTable(tabId: string): string {
 
   if (matrix) {
     const rowNames = tabId === 's' || tabId === 'M' ? (d.satelliteNames || matrix.map((_, i) => `行${i + 1}`)) : names;
+    const visibleMatrix = matrix
+      .slice(0, MAX_RENDER_DIMENSION)
+      .map(row => row.slice(0, MAX_RENDER_DIMENSION));
+    const visibleRowNames = rowNames.slice(0, MAX_RENDER_DIMENSION);
+    const visibleColNames = names.slice(0, MAX_RENDER_DIMENSION);
+    const tableTruncated = matrix.length > MAX_RENDER_DIMENSION ||
+      (matrix[0]?.length || 0) > MAX_RENDER_DIMENSION;
 
     // 头部控制栏：支持切换视图
     const headerHtml = `
@@ -671,6 +730,9 @@ function renderResultTable(tabId: string): string {
         ${headerHtml}
         <div id="heatmap-container" style="width:100%;height:600px;border:1px solid var(--border-color);border-radius:var(--radius-md);"></div>
         <p class="text-sm text-muted mt-sm">提示：深色表示数值较大，鼠标悬停查看详情。</p>
+        ${matrix.length > MAX_HEATMAP_DIMENSION || (matrix[0]?.length || 0) > MAX_HEATMAP_DIMENSION
+          ? `<p class="text-sm text-muted mt-sm">热力图按间隔抽样到最多 ${MAX_HEATMAP_DIMENSION}×${MAX_HEATMAP_DIMENSION}；导出保留完整结果。</p>`
+          : ''}
       `;
     }
 
@@ -678,17 +740,18 @@ function renderResultTable(tabId: string): string {
       ${headerHtml}
       <div class="table-container mt-md" style="max-height:400px;overflow:auto">
         <table class="table">
-          <thead><tr><th></th>${names.map(n => `<th>${n}</th>`).join('')}</tr></thead>
+          <thead><tr><th></th>${visibleColNames.map(n => `<th>${escapeHTML(n)}</th>`).join('')}</tr></thead>
           <tbody>
-            ${matrix.map((row, i) => `
+            ${visibleMatrix.map((row, i) => `
               <tr>
-                <td><strong>${rowNames[i]}</strong></td>
+                <td><strong>${escapeHTML(visibleRowNames[i])}</strong></td>
                 ${row.map(v => `<td class="numeric">${v.toFixed(4)}</td>`).join('')}
               </tr>
             `).join('')}
           </tbody>
         </table>
       </div>
+      ${tableTruncated ? `<p class="text-sm text-muted mt-sm">为保持页面响应，仅显示前 ${MAX_RENDER_DIMENSION} 行和前 ${MAX_RENDER_DIMENSION} 列；导出文件保留完整结果。</p>` : ''}
     `;
   }
 
@@ -702,9 +765,9 @@ function renderFooter(): string {
         <p class="footer-title">📚 权威投入产出数据库</p>
         <div class="footer-links">
           ${IO_DATABASES.map(db => `
-            <a href="${db.url}" target="_blank" class="footer-link">
-              <span class="footer-link-name">${db.name}</span>
-              <span class="footer-link-desc">${db.desc}</span>
+            <a href="${db.url}" target="_blank" rel="noopener noreferrer" class="footer-link">
+              <span class="footer-link-name">${escapeHTML(db.name)}</span>
+              <span class="footer-link-desc">${escapeHTML(db.desc)}</span>
             </a>
           `).join('')}
         </div>
@@ -717,22 +780,23 @@ function renderFooter(): string {
 function renderSheetModal(): string {
   return `
     <div class="modal-overlay" id="sheet-modal">
-      <div class="modal-content">
+      <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="sheet-modal-title" tabindex="-1">
         <div class="modal-header">
-          <h2>📊 选择 Excel Sheet 并指定数据类型</h2>
-          <button class="btn btn-icon" id="btn-close-modal">✕</button>
+          <h2 id="sheet-modal-title">📊 选择 Excel Sheet 并指定数据类型</h2>
+          <button class="btn btn-icon" id="btn-close-modal" aria-label="关闭导入窗口">✕</button>
         </div>
         <div class="modal-body">
-          <p class="text-muted mb-md">文件: ${state.pendingFile?.name || ''} (共 ${state.excelSheets.length} 个 Sheet)</p>
+          <p class="text-muted mb-md">文件: ${escapeHTML(state.pendingFile?.name || '')} (共 ${state.excelSheets.length} 个 Sheet)</p>
           
           <div class="sheet-list">
             ${state.excelSheets.map((sheet, idx) => `
               <div class="sheet-item" data-sheet-idx="${idx}">
                 <div class="sheet-info">
-                  <strong>${sheet.name}</strong>
+                  <strong>${escapeHTML(sheet.name)}</strong>
                   <span class="text-muted">${sheet.rows}×${sheet.cols}</span>
                 </div>
-                <select class="form-select sheet-type-select" data-sheet-idx="${idx}">
+                <label class="sr-only" for="sheet-type-${idx}">为 ${escapeHTML(sheet.name)} 选择数据类型</label>
+                <select class="form-select sheet-type-select" id="sheet-type-${idx}" data-sheet-idx="${idx}">
                   <option value="">-- 跳过 --</option>
                   <option value="Z" ${sheet.name.toLowerCase().includes('z') || sheet.name.includes('中间') ? 'selected' : ''}>Z - 中间投入矩阵</option>
                   <option value="x" ${sheet.name.toLowerCase().includes('x') || sheet.name.includes('产出') ? 'selected' : ''}>x - 总产出向量</option>
@@ -776,19 +840,23 @@ function bindEvents(): void {
 
   // 加载示例
   document.getElementById('btn-sample')?.addEventListener('click', () => {
+    cancelCalculation(false);
     state.data = createSampleIOData();
     state.validation = null;
     state.results = null;
     state.calculationErrors = [];
+    state.calculationWarnings = [];
     updateView();
   });
 
   // 重置
   document.getElementById('btn-reset')?.addEventListener('click', () => {
+    cancelCalculation(false);
     state.data = null;
     state.validation = null;
     state.results = null;
     state.calculationErrors = [];
+    state.calculationWarnings = [];
     state.currentStep = 0;
     state.config = { ...DEFAULT_CONFIG };
     updateView();
@@ -914,6 +982,7 @@ function bindEvents(): void {
 
   document.getElementById('btn-prev-3')?.addEventListener('click', () => { state.currentStep = 1; updateView(); });
   document.getElementById('btn-calculate')?.addEventListener('click', runCalculation);
+  document.getElementById('btn-cancel-calculation')?.addEventListener('click', () => cancelCalculation());
   document.getElementById('btn-prev-4')?.addEventListener('click', () => { state.currentStep = 2; updateView(); });
 
   // 配置复选框
@@ -933,14 +1002,32 @@ function bindEvents(): void {
     state.calculationErrors = [];
   });
 
-  // Tab 切换
-  // Tab 切换
-  document.querySelectorAll('.tab').forEach(el => {
+  // Tab 切换与键盘导航
+  const resultTabs = Array.from(document.querySelectorAll('.tab')) as HTMLButtonElement[];
+  resultTabs.forEach((el, index) => {
     el.addEventListener('click', () => {
       const tabId = el.getAttribute('data-tab') || 'A';
+      if (tabId === state.activeResultTab) return;
       state.activeResultTab = tabId;
       state.viewMode = 'table'; // 切换Tab时重置为表格视图
       updateView();
+      requestAnimationFrame(() => {
+        (document.querySelector(`[data-tab="${tabId}"]`) as HTMLButtonElement | null)?.focus();
+      });
+    });
+    el.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      const offset = event.key === 'ArrowRight' ? 1 : -1;
+      const next = (index + offset + resultTabs.length) % resultTabs.length;
+      const nextTabId = resultTabs[next]?.getAttribute('data-tab');
+      if (!nextTabId) return;
+      state.activeResultTab = nextTabId;
+      state.viewMode = 'table';
+      updateView();
+      requestAnimationFrame(() => {
+        (document.querySelector(`[data-tab="${nextTabId}"]`) as HTMLButtonElement | null)?.focus();
+      });
     });
   });
 
@@ -981,6 +1068,16 @@ function bindEvents(): void {
       closeSheetModal();
     }
   });
+  document.querySelector('.modal-content')?.addEventListener('keydown', (e) => {
+    if ((e as KeyboardEvent).key === 'Escape') closeSheetModal();
+  });
+  if (state.showSheetModal) {
+    requestAnimationFrame(() => {
+      const firstSelect = document.querySelector('.sheet-type-select') as HTMLSelectElement | null;
+      const dialog = document.querySelector('.modal-content') as HTMLElement | null;
+      (firstSelect || dialog)?.focus();
+    });
+  }
 
   // MRIO 配置输入
   document.getElementById('mrio-region-count')?.addEventListener('change', (e) => {
@@ -1349,37 +1446,114 @@ function handlePaste(): void {
 function runCalculation(): void {
   if (!state.data) return;
 
+  cancelCalculation(false);
+
   state.validation = validateIOData(state.data, state.config.tolerance);
   if (state.validation.status === 'fail') {
     state.results = null;
     state.calculationErrors = state.validation.errors
       .filter(error => error.severity === 'error')
-      .map(error => ({ code: error.code, message: error.message, details: error.details }));
+      .map(error => ({ code: error.code, message: error.message, details: error.details, severity: 'error' }));
+    state.calculationWarnings = [];
     state.currentStep = 1;
     updateView();
     return;
   }
 
-  const { results, errors } = calculateIOIndicators(state.data, state.config);
-  if (errors.length > 0) {
-    state.results = null;
-    state.calculationErrors = errors;
-    updateView();
-    return;
-  }
-
-  state.results = results;
+  const requestId = ++calculationRequestId;
+  const worker = new Worker(
+    new URL('./workers/calculation.worker.ts', import.meta.url),
+    { type: 'module' }
+  );
+  calculationWorker = worker;
+  state.isCalculating = true;
+  state.results = null;
   state.calculationErrors = [];
-  state.currentStep = 3;
+  state.calculationWarnings = [];
   updateView();
+
+  worker.onmessage = (event: MessageEvent<CalculationWorkerResponse>) => {
+    const response = event.data;
+    if (response.requestId !== requestId || requestId !== calculationRequestId) return;
+
+    finishCalculationWorker();
+    if (response.type === 'error') {
+      state.calculationErrors = [{
+        code: 'WORKER_CALCULATION_FAILED',
+        message: '后台计算失败',
+        details: response.message,
+        severity: 'error'
+      }];
+      updateView();
+      return;
+    }
+
+    const blocking = response.issues.filter(issue => issue.severity !== 'warning');
+    state.calculationWarnings = response.issues.filter(issue => issue.severity === 'warning');
+    if (blocking.length > 0) {
+      state.calculationErrors = blocking;
+      updateView();
+      return;
+    }
+
+    state.results = response.results;
+    state.calculationErrors = [];
+    state.currentStep = 3;
+    updateView();
+  };
+
+  worker.onerror = (event) => {
+    if (requestId !== calculationRequestId) return;
+    finishCalculationWorker();
+    state.calculationErrors = [{
+      code: 'WORKER_RUNTIME_ERROR',
+      message: '后台计算线程异常',
+      details: event.message,
+      severity: 'error'
+    }];
+    updateView();
+  };
+
+  const request: CalculationWorkerRequest = {
+    type: 'calculate',
+    requestId,
+    data: state.data,
+    config: state.config
+  };
+  worker.postMessage(request);
+}
+
+function finishCalculationWorker(): void {
+  calculationWorker?.terminate();
+  calculationWorker = null;
+  state.isCalculating = false;
+}
+
+function cancelCalculation(update: boolean = true): void {
+  if (!calculationWorker && !state.isCalculating) return;
+  calculationRequestId++;
+  finishCalculationWorker();
+  if (update) updateView();
 }
 
 // 更新视图
 function updateView(): void {
   const app = document.getElementById('app');
   if (app) {
+    disposeHeatmap();
     app.innerHTML = renderApp();
     bindEvents();
+  }
+}
+
+function disposeHeatmap(): void {
+  if (heatmapResizeHandler) {
+    window.removeEventListener('resize', heatmapResizeHandler);
+    heatmapResizeHandler = null;
+  }
+  if (activeHeatmap) {
+    activeHeatmap.dispose();
+    activeHeatmap = null;
   }
 }
 
@@ -1411,24 +1585,39 @@ function renderHeatmap(): void {
     rowNames = state.data.satelliteNames || matrix.map((_, i) => `行${i + 1}`);
   }
 
-  // 生成数字编号作为坐标轴标签
-  const colIndices = colNames.map((_, i) => String(i + 1));
-  const rowIndices = rowNames.map((_, i) => String(i + 1));
+  const rowStep = Math.max(1, Math.ceil(matrix.length / MAX_HEATMAP_DIMENSION));
+  const colStep = Math.max(1, Math.ceil((matrix[0]?.length || 0) / MAX_HEATMAP_DIMENSION));
+  const sampledRows = Array.from(
+    { length: Math.ceil(matrix.length / rowStep) },
+    (_, index) => index * rowStep
+  ).filter(index => index < matrix.length);
+  const sampledCols = Array.from(
+    { length: Math.ceil((matrix[0]?.length || 0) / colStep) },
+    (_, index) => index * colStep
+  ).filter(index => index < (matrix[0]?.length || 0));
+
+  // 生成原始位置编号作为坐标轴标签
+  const colIndices = sampledCols.map(index => String(index + 1));
+  const rowIndices = sampledRows.map(index => String(index + 1));
 
   // 转换数据为 ECharts 格式 [y, x, value]
   const data: [number, number, number][] = [];
-  for (let i = 0; i < matrix.length; i++) {
-    for (let j = 0; j < matrix[i].length; j++) {
-      data.push([j, i, matrix[i][j]]); // x=col, y=row
+  let minVal = Number.POSITIVE_INFINITY;
+  let maxVal = Number.NEGATIVE_INFINITY;
+  for (let rowIndex = 0; rowIndex < sampledRows.length; rowIndex++) {
+    const sourceRow = sampledRows[rowIndex];
+    for (let colIndex = 0; colIndex < sampledCols.length; colIndex++) {
+      const sourceCol = sampledCols[colIndex];
+      const value = matrix[sourceRow][sourceCol];
+      data.push([colIndex, rowIndex, value]);
+      minVal = Math.min(minVal, value);
+      maxVal = Math.max(maxVal, value);
     }
   }
 
+  disposeHeatmap();
   const chart = echarts.init(container);
-
-  // 查找极值以设置颜色范围
-  const flatVals = matrix.flat();
-  const maxVal = Math.max(...flatVals);
-  const minVal = Math.min(...flatVals);
+  activeHeatmap = chart;
 
   // 增强的颜色方案：提高对比度
   const hasNegative = minVal < 0;
@@ -1446,7 +1635,9 @@ function renderHeatmap(): void {
       formatter: (params: any) => {
         const i = params.value[1]; // row
         const j = params.value[0]; // col
-        return `<strong>${rowNames[i]}</strong> → <strong>${colNames[j]}</strong><br>数值: <strong>${params.value[2].toFixed(6)}</strong>`;
+        const sourceRow = sampledRows[i];
+        const sourceCol = sampledCols[j];
+        return `<strong>${escapeHTML(rowNames[sourceRow])}</strong> → <strong>${escapeHTML(colNames[sourceCol])}</strong><br>数值: <strong>${params.value[2].toFixed(6)}</strong>`;
       }
     },
     grid: {
@@ -1495,7 +1686,7 @@ function renderHeatmap(): void {
       type: 'heatmap',
       data: data,
       label: {
-        show: matrix.length < 20, // 部门少时显示数值
+        show: sampledRows.length < 20,
         formatter: (p: any) => p.value[2].toFixed(3),
         fontSize: 9
       },
@@ -1511,7 +1702,8 @@ function renderHeatmap(): void {
   };
 
   chart.setOption(option);
-  window.addEventListener('resize', () => chart.resize());
+  heatmapResizeHandler = () => chart.resize();
+  window.addEventListener('resize', heatmapResizeHandler);
 }
 
 // 启动

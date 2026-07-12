@@ -94,8 +94,17 @@ export interface CalculationResults {
     backwardLinkageNorm?: number[];  // 标准化后向关联
     forwardLinkageNorm?: number[];   // 标准化前向关联
     keyIndustries?: number[];    // 关键产业指数 (后向>1 且 前向>1)
+    numericDiagnostics?: {
+        leontief?: MatrixDiagnostic;
+        ghosh?: MatrixDiagnostic;
+    };
     timestamp?: string;         // 计算时间戳
     config?: CalculationConfig; // 使用的配置
+}
+
+export interface MatrixDiagnostic {
+    inverseResidual: number;
+    conditionEstimate: number;
 }
 
 /** 计算错误 */
@@ -103,6 +112,7 @@ export interface CalculationError {
     code: string;
     message: string;
     details?: string;
+    severity?: 'error' | 'warning';
 }
 
 /** 完整项目状态 */
