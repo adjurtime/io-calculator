@@ -15,7 +15,7 @@ import {
     matrixMultiply,
     matrixSubtract,
     matrixInverse,
-    matrixVectorMultiply,
+    matrixSolve,
     rowSum,
     colSum
 } from './matrix';
@@ -98,45 +98,51 @@ export function calculateIOIndicators(
         results.y = data.Y.map(row => row.reduce((sum, val) => sum + val, 0));
     }
 
-    // 4. Leontief 逆 L = (I - A)^{-1}
+    // 4. Leontief 系统：只有需要展示完整逆矩阵、乘数或产业关联时才显式求逆。
     let L: number[][] | undefined;
-    if (config.computeL || config.computeM || config.computeFootprint || config.computeLinkage) {
+    let IminusA: number[][] | undefined;
+    const leontiefNeedsInverse = config.computeL || config.computeM || config.computeLinkage;
+    if (leontiefNeedsInverse || config.computeFootprint) {
         if (!A) {
             A = matrixMultiply(data.Z, xInvDiag);
         }
 
         const I = identity(n);
-        const IminusA = matrixSubtract(I, A);
+        IminusA = matrixSubtract(I, A);
 
-        const invResult = matrixInverse(IminusA);
-        if (invResult.error) {
-            errors.push({
-                code: 'LEONTIEF_INVERSE_FAILED',
-                message: 'Leontief 逆矩阵计算失败',
-                details: invResult.error
-            });
-        } else {
-            L = invResult.matrix!;
-            results.numericDiagnostics = {
-                ...results.numericDiagnostics,
-                leontief: {
-                    inverseResidual: invResult.inverseResidual || 0,
-                    conditionEstimate: invResult.conditionEstimate || 0
-                }
-            };
-            if ((invResult.conditionEstimate || 0) > CONDITION_WARNING_THRESHOLD) {
+        if (leontiefNeedsInverse) {
+            const invResult = matrixInverse(IminusA);
+            if (invResult.error) {
                 errors.push({
-                    code: 'LEONTIEF_ILL_CONDITIONED',
-                    message: 'Leontief 系统可能病态，结果对输入误差较敏感',
-                    details: `无穷范数条件估计约为 ${(invResult.conditionEstimate || 0).toExponential(4)}`,
-                    severity: 'warning'
+                    code: 'LEONTIEF_INVERSE_FAILED',
+                    message: 'Leontief 逆矩阵计算失败',
+                    details: invResult.error,
+                    severity: 'error'
                 });
-            }
-            if (config.computeL) {
-                results.L = L;
+            } else {
+                L = invResult.matrix!;
+                results.numericDiagnostics = {
+                    ...results.numericDiagnostics,
+                    leontief: {
+                        method: 'inverse',
+                        residual: invResult.inverseResidual ?? 0,
+                        conditionEstimate: invResult.conditionEstimate
+                    }
+                };
+                if ((invResult.conditionEstimate ?? 0) > CONDITION_WARNING_THRESHOLD) {
+                    errors.push({
+                        code: 'LEONTIEF_ILL_CONDITIONED',
+                        message: 'Leontief 系统可能病态，结果对输入误差较敏感',
+                        details: `无穷范数条件估计约为 ${(invResult.conditionEstimate ?? 0).toExponential(4)}`,
+                        severity: 'warning'
+                    });
+                }
+                if (config.computeL) {
+                    results.L = L;
 
-                // 计算产出乘数（L 列和）
-                results.outputMultiplier = colSum(L);
+                    // 计算产出乘数（L 列和）
+                    results.outputMultiplier = colSum(L);
+                }
             }
         }
     }
@@ -165,15 +171,16 @@ export function calculateIOIndicators(
             results.numericDiagnostics = {
                 ...results.numericDiagnostics,
                 ghosh: {
-                    inverseResidual: ghoshResult.inverseResidual || 0,
-                    conditionEstimate: ghoshResult.conditionEstimate || 0
+                    method: 'inverse',
+                    residual: ghoshResult.inverseResidual ?? 0,
+                    conditionEstimate: ghoshResult.conditionEstimate
                 }
             };
-            if ((ghoshResult.conditionEstimate || 0) > CONDITION_WARNING_THRESHOLD) {
+            if ((ghoshResult.conditionEstimate ?? 0) > CONDITION_WARNING_THRESHOLD) {
                 errors.push({
                     code: 'GHOSH_ILL_CONDITIONED',
                     message: 'Ghosh 系统可能病态，结果对输入误差较敏感',
-                    details: `无穷范数条件估计约为 ${(ghoshResult.conditionEstimate || 0).toExponential(4)}`,
+                    details: `无穷范数条件估计约为 ${(ghoshResult.conditionEstimate ?? 0).toExponential(4)}`,
                     severity: 'warning'
                 });
             }
@@ -241,15 +248,35 @@ export function calculateIOIndicators(
         }
     }
 
-    // 9. 部门足迹 footprint = M · y 或 M · Y
-    if (config.computeFootprint && M && data.Y) {
-        if (config.aggregateFinalDemand && results.y) {
-            // 使用合并后的最终需求
-            const footprintVector = matrixVectorMultiply(M, results.y);
-            results.footprint = footprintVector.map(value => [value]);
-        } else {
-            // 按最终需求分项计算
-            results.footprint = matrixMultiply(M, data.Y);
+    // 9. 部门足迹：已有完整 L 时使用 M；否则直接求解 (I-A)X=Y。
+    if (config.computeFootprint && s && data.Y) {
+        if (M) {
+            const demand = config.aggregateFinalDemand && results.y
+                ? results.y.map(value => [value])
+                : data.Y;
+            results.footprint = matrixMultiply(M, demand);
+        } else if (!leontiefNeedsInverse && IminusA) {
+            const demand = config.aggregateFinalDemand && results.y
+                ? results.y.map(value => [value])
+                : data.Y;
+            const solveResult = matrixSolve(IminusA, demand);
+            if (solveResult.error) {
+                errors.push({
+                    code: 'LEONTIEF_SOLVE_FAILED',
+                    message: 'Leontief 线性方程求解失败',
+                    details: solveResult.error,
+                    severity: 'error'
+                });
+            } else {
+                results.numericDiagnostics = {
+                    ...results.numericDiagnostics,
+                    leontief: {
+                        method: 'solve',
+                        residual: solveResult.solveResidual ?? 0
+                    }
+                };
+                results.footprint = matrixMultiply(s, solveResult.matrix!);
+            }
         }
     }
 

@@ -103,8 +103,9 @@ export interface CalculationResults {
 }
 
 export interface MatrixDiagnostic {
-    inverseResidual: number;
-    conditionEstimate: number;
+    method: 'inverse' | 'solve';
+    residual: number;
+    conditionEstimate?: number;
 }
 
 /** 计算错误 */

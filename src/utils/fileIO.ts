@@ -3,7 +3,6 @@
  * 支持 Excel（.xlsx）和 CSV 文件读取
  */
 
-import * as XLSX from 'xlsx';
 import type { IOData } from '../types/io';
 
 export interface MatrixParseError {
@@ -24,6 +23,30 @@ export interface ParsedNumericVector extends ParsedNumericMatrix {
     vector: number[];
 }
 
+export type ExcelSheetType = 'Z' | 'x' | 'Y' | 'VA' | 'F' | 'sectors' | 'regions' | '';
+
+/**
+ * 只对明确的输入 Sheet 名称做默认映射，避免把计算结果误当成原始输入。
+ */
+export function inferExcelSheetType(name: string): ExcelSheetType {
+    const normalized = name.trim().toLowerCase();
+    const hasPrefix = (prefix: string): boolean =>
+        normalized === prefix ||
+        normalized.startsWith(`${prefix}_`) ||
+        normalized.startsWith(`${prefix}-`) ||
+        normalized.startsWith(`${prefix} `);
+
+    if (normalized.startsWith('va_coef')) return '';
+    if (hasPrefix('z') || normalized === '中间投入' || normalized === '中间消耗') return 'Z';
+    if (hasPrefix('x') || normalized === '总产出') return 'x';
+    if (hasPrefix('y') || normalized === '最终需求') return 'Y';
+    if (hasPrefix('va') || normalized === '增加值') return 'VA';
+    if (hasPrefix('f') || ['卫星账户', '排放', 'emission', 'satellite'].includes(normalized)) return 'F';
+    if (['sector', 'sectors', '部门', '部门名称'].includes(normalized)) return 'sectors';
+    if (['region', 'regions', '区域', '区域名称', '地区', '地区名称'].includes(normalized)) return 'regions';
+    return '';
+}
+
 /**
  * 读取 Excel 文件
  */
@@ -32,16 +55,18 @@ export async function readExcelFile(file: File): Promise<{
     error?: string;
 }> {
     try {
+        const XLSX = await import('xlsx');
         const buffer = await file.arrayBuffer();
         const workbook = XLSX.read(buffer, { type: 'array' });
 
         const sheets = workbook.SheetNames.map(name => {
             const worksheet = workbook.Sheets[name];
-            const data = XLSX.utils.sheet_to_json<string[]>(worksheet, {
+            const rows = XLSX.utils.sheet_to_json<(string | number | boolean)[]>(worksheet, {
                 header: 1,
                 defval: ''
             });
-            return { name, data: data as string[][] };
+            const data = rows.map(row => row.map(value => String(value ?? '')));
+            return { name, data };
         });
 
         return { sheets };

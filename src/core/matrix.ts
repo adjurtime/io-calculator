@@ -18,6 +18,12 @@ export interface MatrixInverseResult {
     conditionEstimate?: number;
 }
 
+export interface MatrixSolveResult {
+    matrix: number[][] | null;
+    error: string | null;
+    solveResidual?: number;
+}
+
 /**
  * 创建 n×n 单位矩阵
  */
@@ -171,6 +177,98 @@ export function matrixInverse(A: number[][]): MatrixInverseResult {
         return {
             matrix: null,
             error: `矩阵求逆失败：${e instanceof Error ? e.message : '未知错误'}`
+        };
+    }
+}
+
+/**
+ * 求解 A X = B，不显式构造 A⁻¹。
+ */
+export function matrixSolve(A: number[][], B: number[][]): MatrixSolveResult {
+    try {
+        const n = A.length;
+        const rhsColumns = B[0]?.length || 0;
+        if (n === 0 || A.some(row => row.length !== n)) {
+            return { matrix: null, error: '系数矩阵必须是非空方阵' };
+        }
+        if (B.length !== n || rhsColumns === 0 || B.some(row => row.length !== rhsColumns)) {
+            return { matrix: null, error: '右端矩阵维度与系数矩阵不匹配' };
+        }
+        if ([...A, ...B].some(row => row.some(value => !Number.isFinite(value)))) {
+            return { matrix: null, error: '线性系统包含 NaN 或 Infinity' };
+        }
+
+        const upper = A.map(row => [...row]);
+        const transformedRhs = B.map(row => [...row]);
+        const matrixScale = matrixInfinityNorm(A);
+        if (matrixScale === 0) {
+            return { matrix: null, error: '线性方程组奇异或接近奇异' };
+        }
+        const pivotTolerance = Number.EPSILON * Math.max(1, n) * matrixScale;
+
+        for (let column = 0; column < n; column++) {
+            let pivotRow = column;
+            for (let row = column + 1; row < n; row++) {
+                if (Math.abs(upper[row][column]) > Math.abs(upper[pivotRow][column])) {
+                    pivotRow = row;
+                }
+            }
+            if (Math.abs(upper[pivotRow][column]) <= pivotTolerance) {
+                return { matrix: null, error: '线性方程组奇异或接近奇异' };
+            }
+            if (pivotRow !== column) {
+                [upper[column], upper[pivotRow]] = [upper[pivotRow], upper[column]];
+                [transformedRhs[column], transformedRhs[pivotRow]] = [transformedRhs[pivotRow], transformedRhs[column]];
+            }
+
+            for (let row = column + 1; row < n; row++) {
+                const factor = upper[row][column] / upper[column][column];
+                upper[row][column] = 0;
+                for (let j = column + 1; j < n; j++) {
+                    upper[row][j] -= factor * upper[column][j];
+                }
+                for (let rhs = 0; rhs < rhsColumns; rhs++) {
+                    transformedRhs[row][rhs] -= factor * transformedRhs[column][rhs];
+                }
+            }
+        }
+
+        const solution = Array.from({ length: n }, () => Array(rhsColumns).fill(0) as number[]);
+        for (let row = n - 1; row >= 0; row--) {
+            for (let rhs = 0; rhs < rhsColumns; rhs++) {
+                let value = transformedRhs[row][rhs];
+                for (let column = row + 1; column < n; column++) {
+                    value -= upper[row][column] * solution[column][rhs];
+                }
+                solution[row][rhs] = value / upper[row][row];
+            }
+        }
+
+        const reconstructed = matrixMultiply(A, solution);
+        let maxResidual = 0;
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < rhsColumns; j++) {
+                maxResidual = Math.max(maxResidual, Math.abs(reconstructed[i][j] - B[i][j]));
+            }
+        }
+
+        const residualScale = Math.max(
+            1,
+            matrixInfinityNorm(A) * matrixInfinityNorm(solution),
+            matrixInfinityNorm(B)
+        );
+        if (!Number.isFinite(maxResidual) || maxResidual > 1e-10 * residualScale * Math.max(1, n)) {
+            return {
+                matrix: null,
+                error: `线性方程求解残差过大（${maxResidual.toExponential(4)}）`
+            };
+        }
+
+        return { matrix: solution, error: null, solveResidual: maxResidual };
+    } catch (e) {
+        return {
+            matrix: null,
+            error: `线性方程求解失败：${e instanceof Error ? e.message : '未知错误'}`
         };
     }
 }

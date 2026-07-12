@@ -3,18 +3,25 @@
  * 支持 Excel、CSV、JSON 导出
  */
 
-import * as XLSX from 'xlsx';
+import type { WorkBook } from 'xlsx';
 import type { IOData, CalculationResults, ValidationResult } from '../types/io';
+
+type SpreadsheetModule = typeof import('xlsx');
 
 /**
  * 导出计算结果为 Excel（多 sheet）
  */
-export function exportResultsToExcel(
+export async function exportResultsToExcel(
     data: IOData,
     results: CalculationResults,
     validation?: ValidationResult
-): void {
+): Promise<void> {
+    const XLSX = await import('xlsx');
     const workbook = XLSX.utils.book_new();
+    const addMatrixSheet = appendMatrixSheet.bind(null, XLSX);
+    const addVectorSheet = appendVectorSheet.bind(null, XLSX);
+    const addValidationSheet = appendValidationSheet.bind(null, XLSX);
+    const addLogSheet = appendLogSheet.bind(null, XLSX);
 
     const sectorNames = data.sectorNames ||
         Array.from({ length: data.x.length }, (_, i) => `部门${i + 1}`);
@@ -138,8 +145,9 @@ export function exportResultsToExcel(
 /**
  * 添加矩阵 sheet
  */
-function addMatrixSheet(
-    workbook: XLSX.WorkBook,
+function appendMatrixSheet(
+    XLSX: SpreadsheetModule,
+    workbook: WorkBook,
     sheetName: string,
     matrix: number[][],
     rowNames: string[],
@@ -163,8 +171,9 @@ function addMatrixSheet(
 /**
  * 添加向量 sheet
  */
-function addVectorSheet(
-    workbook: XLSX.WorkBook,
+function appendVectorSheet(
+    XLSX: SpreadsheetModule,
+    workbook: WorkBook,
     sheetName: string,
     vector: number[],
     names: string[]
@@ -182,8 +191,9 @@ function addVectorSheet(
 /**
  * 添加校验报告 sheet
  */
-function addValidationSheet(
-    workbook: XLSX.WorkBook,
+function appendValidationSheet(
+    XLSX: SpreadsheetModule,
+    workbook: WorkBook,
     validation: ValidationResult
 ): void {
     const data: (string | number)[][] = [
@@ -226,8 +236,9 @@ function addValidationSheet(
 /**
  * 添加计算日志 sheet
  */
-function addLogSheet(
-    workbook: XLSX.WorkBook,
+function appendLogSheet(
+    XLSX: SpreadsheetModule,
+    workbook: WorkBook,
     data: IOData,
     results: CalculationResults
 ): void {
@@ -267,12 +278,20 @@ function addLogSheet(
         logData.push(['']);
         logData.push(['数值诊断']);
         if (results.numericDiagnostics.leontief) {
-            logData.push(['Leontief 条件估计', results.numericDiagnostics.leontief.conditionEstimate]);
-            logData.push(['Leontief 逆矩阵残差', results.numericDiagnostics.leontief.inverseResidual]);
+            const diagnostic = results.numericDiagnostics.leontief;
+            logData.push(['Leontief 计算方式', diagnostic.method === 'solve' ? '线性方程求解' : '显式逆矩阵']);
+            if (diagnostic.conditionEstimate !== undefined) {
+                logData.push(['Leontief 条件估计', diagnostic.conditionEstimate]);
+            }
+            logData.push(['Leontief 残差', diagnostic.residual]);
         }
         if (results.numericDiagnostics.ghosh) {
-            logData.push(['Ghosh 条件估计', results.numericDiagnostics.ghosh.conditionEstimate]);
-            logData.push(['Ghosh 逆矩阵残差', results.numericDiagnostics.ghosh.inverseResidual]);
+            const diagnostic = results.numericDiagnostics.ghosh;
+            logData.push(['Ghosh 计算方式', diagnostic.method === 'solve' ? '线性方程求解' : '显式逆矩阵']);
+            if (diagnostic.conditionEstimate !== undefined) {
+                logData.push(['Ghosh 条件估计', diagnostic.conditionEstimate]);
+            }
+            logData.push(['Ghosh 残差', diagnostic.residual]);
         }
     }
 
@@ -333,7 +352,7 @@ export function exportResultsToJSON(
     validation?: ValidationResult
 ): void {
     const exportData = {
-        version: '2.0-alpha.2',
+        version: '2.0-alpha.3',
         exportedAt: new Date().toISOString(),
         metadata: data.metadata,
         dimensions: {

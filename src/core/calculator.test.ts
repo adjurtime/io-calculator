@@ -55,7 +55,8 @@ describe('calculateIOIndicators', () => {
         expect(results.footprint?.[0][0]).toBeCloseTo(30, 10);
         expect(results.footprint?.[1][0]).toBeCloseTo(150, 10);
         expect(results.numericDiagnostics?.leontief?.conditionEstimate).toBeGreaterThanOrEqual(1);
-        expect(results.numericDiagnostics?.leontief?.inverseResidual).toBeLessThan(1e-10);
+        expect(results.numericDiagnostics?.leontief?.method).toBe('inverse');
+        expect(results.numericDiagnostics?.leontief?.residual).toBeLessThan(1e-10);
     });
 
     it('computes footprint dependencies even when A, L, s, and M are not requested for display', () => {
@@ -66,6 +67,9 @@ describe('calculateIOIndicators', () => {
         expect(results.L).toBeUndefined();
         expect(results.s).toBeUndefined();
         expect(results.M).toBeUndefined();
+        expect(results.numericDiagnostics?.leontief?.method).toBe('solve');
+        expect(results.numericDiagnostics?.leontief?.conditionEstimate).toBeUndefined();
+        expect(results.numericDiagnostics?.leontief?.residual).toBeLessThan(1e-10);
         expect(results.footprint?.map(row => row[0])).toEqual([
             expect.closeTo(30, 10),
             expect.closeTo(150, 10)

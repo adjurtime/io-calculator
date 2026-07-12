@@ -10,6 +10,7 @@ import { MAX_HEATMAP_DIMENSION, MAX_RENDER_DIMENSION } from './core/limits';
 import {
   createSampleIOData,
   formatMatrixParseErrors,
+  inferExcelSheetType,
   parseClipboardMatrix,
   parseNumericMatrix,
   parseNumericVector,
@@ -527,11 +528,13 @@ function renderNumericDiagnostic(
   diagnostic: MatrixDiagnostic | undefined
 ): string {
   if (!diagnostic) return '';
+  const method = diagnostic.method === 'solve' ? '线性方程求解' : '显式逆矩阵';
   return `
     <div>
       <strong>${name}</strong>
-      <p class="text-muted text-sm">条件估计：${diagnostic.conditionEstimate.toExponential(4)}</p>
-      <p class="text-muted text-sm">逆矩阵残差：${diagnostic.inverseResidual.toExponential(4)}</p>
+      <p class="text-muted text-sm">计算方式：${method}</p>
+      ${diagnostic.conditionEstimate === undefined ? '' : `<p class="text-muted text-sm">条件估计：${diagnostic.conditionEstimate.toExponential(4)}</p>`}
+      <p class="text-muted text-sm">${diagnostic.method === 'solve' ? '求解' : '逆矩阵'}残差：${diagnostic.residual.toExponential(4)}</p>
     </div>
   `;
 }
@@ -789,7 +792,9 @@ function renderSheetModal(): string {
           <p class="text-muted mb-md">文件: ${escapeHTML(state.pendingFile?.name || '')} (共 ${state.excelSheets.length} 个 Sheet)</p>
           
           <div class="sheet-list">
-            ${state.excelSheets.map((sheet, idx) => `
+            ${state.excelSheets.map((sheet, idx) => {
+              const inferredType = inferExcelSheetType(sheet.name);
+              return `
               <div class="sheet-item" data-sheet-idx="${idx}">
                 <div class="sheet-info">
                   <strong>${escapeHTML(sheet.name)}</strong>
@@ -797,22 +802,22 @@ function renderSheetModal(): string {
                 </div>
                 <label class="sr-only" for="sheet-type-${idx}">为 ${escapeHTML(sheet.name)} 选择数据类型</label>
                 <select class="form-select sheet-type-select" id="sheet-type-${idx}" data-sheet-idx="${idx}">
-                  <option value="">-- 跳过 --</option>
-                  <option value="Z" ${sheet.name.toLowerCase().includes('z') || sheet.name.includes('中间') ? 'selected' : ''}>Z - 中间投入矩阵</option>
-                  <option value="x" ${sheet.name.toLowerCase().includes('x') || sheet.name.includes('产出') ? 'selected' : ''}>x - 总产出向量</option>
-                  <option value="Y" ${sheet.name.toLowerCase().includes('y') || sheet.name.includes('需求') ? 'selected' : ''}>Y - 最终需求</option>
-                  <option value="VA" ${sheet.name.toLowerCase().includes('va') || sheet.name.includes('增加值') ? 'selected' : ''}>VA - 增加值</option>
-                  <option value="F" ${sheet.name.toLowerCase().includes('f') || sheet.name.includes('排放') || sheet.name.includes('卫星') ? 'selected' : ''}>F - 卫星账户</option>
-                  <option value="sectors" ${sheet.name.includes('部门') || sheet.name.toLowerCase().includes('sector') ? 'selected' : ''}>📋 部门名称列表</option>
-                  <option value="regions" ${sheet.name.includes('区域') || sheet.name.includes('地区') || sheet.name.toLowerCase().includes('region') ? 'selected' : ''}>🌍 区域名称列表</option>
+                  <option value="" ${inferredType === '' ? 'selected' : ''}>-- 跳过 --</option>
+                  <option value="Z" ${inferredType === 'Z' ? 'selected' : ''}>Z - 中间投入矩阵</option>
+                  <option value="x" ${inferredType === 'x' ? 'selected' : ''}>x - 总产出向量</option>
+                  <option value="Y" ${inferredType === 'Y' ? 'selected' : ''}>Y - 最终需求</option>
+                  <option value="VA" ${inferredType === 'VA' ? 'selected' : ''}>VA - 增加值</option>
+                  <option value="F" ${inferredType === 'F' ? 'selected' : ''}>F - 卫星账户</option>
+                  <option value="sectors" ${inferredType === 'sectors' ? 'selected' : ''}>📋 部门名称列表</option>
+                  <option value="regions" ${inferredType === 'regions' ? 'selected' : ''}>🌍 区域名称列表</option>
                 </select>
               </div>
-            `).join('')}
+            `}).join('')}
           </div>
           
           <div class="form-group mt-md">
             <label class="form-label">
-              <input type="checkbox" id="modal-has-headers"> 第一行/列为标题（自动提取部门名称）
+              <input type="checkbox" id="modal-has-headers" checked> 第一行/列为标题（自动提取部门名称）
             </label>
           </div>
         </div>
@@ -1048,9 +1053,13 @@ function bindEvents(): void {
   }
 
   // 导出
-  document.getElementById('btn-export-excel')?.addEventListener('click', () => {
+  document.getElementById('btn-export-excel')?.addEventListener('click', async () => {
     if (state.data && state.results) {
-      exportResultsToExcel(state.data, state.results, state.validation || undefined);
+      try {
+        await exportResultsToExcel(state.data, state.results, state.validation || undefined);
+      } catch (error) {
+        alert(`Excel 导出失败：${error instanceof Error ? error.message : '未知错误'}`);
+      }
     }
   });
   document.getElementById('btn-export-json')?.addEventListener('click', () => {
