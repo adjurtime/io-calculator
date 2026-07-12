@@ -2,6 +2,7 @@
   "name": "io-calculator",
   "version": "2.0.0-alpha.3",
   "description": "投入产出分析网页应用 - 浏览器端计算工具",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
